@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import copy
+import json
 import logging
 import os
 import re
@@ -31,6 +32,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.torch_functional import pad_sequence_to_length
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +141,29 @@ class RLHFDataset(Dataset):
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
 
+        # Teacher-student version related parameters (optional)
+        self.ts_version = config.get("ts_version", None)
+        self.teacher_hint_dict = config.get("teacher_hint_dict", None)
+        self.crafted_wrong_answer = config.get("crafted_wrong_answer", None)
+        self.teacher_lemmas = config.get("teacher_lemmas", None)
+        self.subproblems_dict = config.get("subproblems_dict", None)
+        self.subproblems_jsonl_path = "/hyk/algorithm_new/qinghua/yueyang/verl/data/subproblems.jsonl"
+        
+        # Load subproblems_dict if jsonl_path is provided
+        if self.subproblems_jsonl_path is not None and self.subproblems_dict is None:
+            self.subproblems_dict = {}
+            try:
+                with open(self.subproblems_jsonl_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            data = json.loads(line)
+                            problem_id = str(data.get('problem_id', ''))
+                            if problem_id:
+                                self.subproblems_dict[problem_id] = data
+            except Exception as e:
+                logger.warning(f"Failed to load subproblems from {self.subproblems_jsonl_path}: {e}")
+                self.subproblems_dict = {}
         self._download()
         self._read_files_and_tokenize()
 
@@ -450,7 +475,321 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+        
+        # Process teacher-student versions if enabled
+        if self.ts_version is not None:
+            self._process_ts_version(row_dict, messages, raw_prompt)
+        
         return row_dict
+
+    def _process_ts_version(self, row_dict: dict, messages: list, raw_prompt: str):
+        """
+        Process teacher-student version specific modifications to the prompt.
+        
+        Args:
+            row_dict: The row dictionary to modify
+            messages: The original messages list
+            raw_prompt: The raw prompt string after chat template
+        """
+        if self.ts_version == 'v1':
+            self._process_ts_v1(row_dict, raw_prompt)
+        elif self.ts_version == 'v2':
+            self._process_ts_v2(row_dict, messages, raw_prompt)
+        elif self.ts_version == 'v3':
+            self._process_ts_v3(row_dict, messages, raw_prompt)
+        elif self.ts_version == 'v4':
+            self._process_ts_v4(row_dict, messages, raw_prompt)
+        elif self.ts_version == 'v5' or self.ts_version == 'v7':
+            self._process_ts_v5(row_dict, messages, raw_prompt)
+    
+    def _process_ts_v1(self, row_dict: dict, raw_prompt: str):
+        """Process ts_version v1: Add teacher hints to prompts."""
+        if self.teacher_hint_dict is None:
+            return
+        
+        problem_id = row_dict.get('problem_id')
+        if problem_id is None:
+            return
+        
+        problem_id_str = str(problem_id)
+        # Get original messages
+        original_messages = row_dict.get('raw_prompt', [])
+        if not original_messages:
+            return
+        
+        if problem_id_str not in self.teacher_hint_dict:
+            row_dict['raw_prompt_hint'] = original_messages
+            return
+        
+        hint_str = self.teacher_hint_dict[problem_id_str]
+        if hint_str == "":
+            row_dict['raw_prompt_hint'] = original_messages
+            return
+        
+        try:
+            hint_data = json.loads(hint_str)
+            correct_prefix = hint_data.get("correct_prefix", "")
+            teacher_hint = hint_data.get("hint", "")
+            
+            if len(correct_prefix) > 4000 or len(teacher_hint) > 500:
+                logger.warning(
+                    f"problem_id {problem_id} has too long correct_prefix or teacher_hint, skip hint addition."
+                )
+                row_dict['raw_prompt_hint'] = original_messages
+                return
+            
+            # Get original system and user prompts
+            sys_prompt = original_messages[0]['content'] if len(original_messages) > 0 and original_messages[0].get('role') == 'system' else ""
+            user_prompt = original_messages[1]['content'] if len(original_messages) > 1 and original_messages[1].get('role') == 'user' else original_messages[0]['content'] if len(original_messages) > 0 else ""
+            
+            # Build new user prompt with hint
+            hint_prompt_before = "**Important Hint**: "
+            hint_prompt_after = "\nPlease continue your response based on the above hint.\n"
+            teacher_hint_text = hint_prompt_before + teacher_hint + hint_prompt_after
+            new_user_prompt = user_prompt + "\n\n" + teacher_hint_text
+            
+            # Build new messages
+            new_messages = []
+            if sys_prompt:
+                new_messages.append({"role": "system", "content": sys_prompt})
+            new_messages.append({"role": "user", "content": new_user_prompt})
+            
+            row_dict['raw_prompt_hint'] = new_messages
+        except Exception as e:
+            logger.warning(f"Error processing ts_v1 for problem_id {problem_id}: {e}")
+            row_dict['raw_prompt_hint'] = original_messages
+    
+    def _process_ts_v2(self, row_dict: dict, messages: list, raw_prompt: str):
+        """Process ts_version v2: Add crafted wrong answers to prompts."""
+        if self.crafted_wrong_answer is None:
+            return
+        
+        problem_id = row_dict.get('problem_id')
+        if problem_id is None:
+            return
+        
+        problem_id_str = str(problem_id)
+        original_messages = messages
+        
+        if problem_id_str not in self.crafted_wrong_answer:
+            row_dict['raw_prompt_hint'] = original_messages
+            return
+        
+        wrong_answer_dict = self.crafted_wrong_answer[problem_id_str]
+        raw_problem = messages[1]['content'] if len(messages) > 1 else ""
+        crafted_wrong_answer = wrong_answer_dict.get('wrong_answer', "")
+        error_type = wrong_answer_dict.get('error_type', "")
+        
+        if crafted_wrong_answer == "" or error_type == "parsing_failed":
+            row_dict['raw_prompt_hint'] = original_messages
+            return
+        
+        if len(crafted_wrong_answer) > 4000:
+            logger.warning(
+                f"problem_id {problem_id} has too long crafted_wrong_answer, skip hint addition."
+            )
+            row_dict['raw_prompt_hint'] = original_messages
+            return
+        
+        system_prompt = """You are given a problem and a solution that contains a subtle error and wrong final answer.
+Your task is to carefully analyze the provided solution, identify what is wrong or questionable, explain why it is incorrect, and provide the correct reasoning and final answer. Structure your response into two sections: Thought and Solution. In the Thought section, present your reasoning using the format: "<think>\n thoughts </think>\n". Each thought should include detailed analysis, brainstorming, verification, and refinement of ideas. After "</think>\n," in the Solution section, provide the final, logical, and accurate answer, clearly derived from the exploration in the Thought section. If applicable, include the answer in \\boxed{}.
+"""
+        user_prompt = f"""**Problem:** {raw_problem}\n**Provided Solution (Contains ONE Error):**{crafted_wrong_answer}\n**Your Task:** Examine the solution above critically in your <think> section. Then, after "</think>\n", in your Solution section, provide the correct solution with final answer in \\boxed{{}}"""
+        
+        # Build new messages
+        new_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        row_dict['raw_prompt_hint'] = new_messages
+    
+    def _process_ts_v3(self, row_dict: dict, messages: list, raw_prompt: str):
+        """Process ts_version v3: Add crafted wrong answers and lemmas to prompts."""
+        if self.crafted_wrong_answer is None or self.teacher_lemmas is None:
+            return
+        
+        problem_id = row_dict.get('problem_id')
+        if problem_id is None:
+            return
+        
+        problem_id_str = str(problem_id)
+        original_messages = messages
+        raw_problem = messages[1]['content'] if len(messages) > 1 else ""
+        sys_prompt = messages[0]['content'] if len(messages) > 0 and messages[0].get('role') == 'system' else ""
+        
+        # Process crafted wrong answer
+        if problem_id_str in self.crafted_wrong_answer:
+            wrong_answer_dict = self.crafted_wrong_answer[problem_id_str]
+            crafted_wrong_answer = wrong_answer_dict.get('wrong_answer', "")
+            error_type = wrong_answer_dict.get('error_type', "")
+            
+            if crafted_wrong_answer == "" or error_type == "parsing_failed":
+                row_dict['raw_prompt_crafted'] = original_messages
+            elif len(crafted_wrong_answer) > 4000:
+                logger.warning(
+                    f"problem_id {problem_id} has too long crafted_wrong_answer, skip hint addition."
+                )
+                row_dict['raw_prompt_crafted'] = original_messages
+            else:
+                system_prompt = """You are given a problem and a solution that contains a subtle error and wrong final answer.Your task is to carefully analyze the provided solution, identify what is wrong or questionable, explain why it is incorrect, and provide the correct reasoning and final answer. Structure your response into two sections: Thought and Solution. In the Thought section, present your reasoning using the format: "<think>\n thoughts </think>\n". Each thought should include detailed analysis, brainstorming, verification, and refinement of ideas. After "</think>\n," in the Solution section, provide the final, logical, and accurate answer, clearly derived from the exploration in the Thought section. If applicable, include the answer in \\boxed{}."""
+                user_prompt = f"""**Problem:** {raw_problem}\n**Provided Solution (Contains ONE Error and the final answer is wrong):**{crafted_wrong_answer}\n**Your Task:** Examine the solution above critically in your <think> section. Then, after "</think>\n", in your Solution section, provide the correct solution with final answer in \\boxed{{}}"""
+                
+                new_messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+                row_dict['raw_prompt_crafted'] = new_messages
+        else:
+            row_dict['raw_prompt_crafted'] = original_messages
+        
+        # Process lemmas
+        if problem_id_str in self.teacher_lemmas:
+            teacher_lemma_dict = self.teacher_lemmas[problem_id_str]
+            for i in range(1, 4):
+                lemma_key = f"lemma{i}"
+                prompt_key = f"raw_prompt_lemma{i}"
+                teacher_lemma = teacher_lemma_dict.get(lemma_key, {"lemma": "", "insight": ""})
+                
+                if teacher_lemma.get("lemma", "") == "":
+                    row_dict[prompt_key] = original_messages
+                    continue
+                
+                lemma = teacher_lemma.get("lemma", "")
+                insight = teacher_lemma.get("insight", "")
+                
+                lemma_prompt = f"Problem: {raw_problem}\n\nUseful lemma: {lemma}\n\nWhy this matters: {insight}\n\nUsing this hint, solve the problem step by step and provide your answer in \\boxed{{}}."
+                user_prompt = lemma_prompt
+                
+                new_messages = []
+                if sys_prompt:
+                    new_messages.append({"role": "system", "content": sys_prompt})
+                new_messages.append({"role": "user", "content": user_prompt})
+                
+                row_dict[prompt_key] = new_messages
+        else:
+            for i in range(1, 4):
+                row_dict[f'raw_prompt_lemma{i}'] = original_messages
+    
+    def _process_ts_v4(self, row_dict: dict, messages: list, raw_prompt: str):
+        """Process ts_version v4: Add progressive subproblems to prompts."""
+        if self.subproblems_dict is None:
+            return
+        
+        problem_id = row_dict.get('problem_id')
+        if problem_id is None:
+            return
+        
+        problem_id_str = str(problem_id)
+        if problem_id_str not in self.subproblems_dict:
+            return
+        
+        subproblem_data = self.subproblems_dict[problem_id_str]
+        problem_statement = subproblem_data.get('problem_statement', "")
+        q_1 = subproblem_data.get('question_1', {}).get('statement', "")
+        q_2 = subproblem_data.get('question_2', {}).get('statement', "")
+        q_3 = subproblem_data.get('question_3', {}).get('statement', "")
+        q_4 = subproblem_data.get('question_4', {}).get('statement', "")
+        a_1 = subproblem_data.get('question_1', {}).get('ground_truth', "")
+        a_2 = subproblem_data.get('question_2', {}).get('ground_truth', "")
+        a_3 = subproblem_data.get('question_3', {}).get('ground_truth', "")
+        a_4 = subproblem_data.get('question_4', {}).get('ground_truth', "")
+        
+        sys_prompt = """You are given a problem statement with progressive subproblems. Solve each subproblem sequentially, understanding how each builds upon the previous one, and provide the solution to **the last subproblem only**. Structure your response into two sections: In the Thought section, use "<think>\n{your thoughts}\n</think>" format with detailed analysis of each subproblem, step-by-step reasoning, and connections between subproblems. In the Solution section after "</think>", provide the final answer to the last subproblem clearly derived from your thought process, enclosed in \\boxed{}.\n"""
+        statement_prompt = f"Problem Statement: {problem_statement}\n"
+        subproblem1_prompt = f"Subproblem 1: {q_1}\n"
+        subproblem2_prompt = f"Subproblem 2: {q_2}\n"
+        subproblem3_prompt = f"Subproblem 3: {q_3}\n"
+        subproblem4_prompt = f"Subproblem 4: {q_4}\n"
+        user_prompt_base = """Please solve each subproblem carefully in the given order, use insights from earlier subproblems to inform later ones. Make sure your final answer to **the last subproblem only** is written as \\boxed{your_answer_here}."""
+        
+        # Build messages for each subproblem variant
+        user_prompts = [
+            statement_prompt + subproblem1_prompt + user_prompt_base,
+            statement_prompt + subproblem1_prompt + subproblem2_prompt + user_prompt_base,
+            statement_prompt + subproblem1_prompt + subproblem2_prompt + subproblem3_prompt + user_prompt_base,
+            statement_prompt + subproblem1_prompt + subproblem2_prompt + subproblem3_prompt + subproblem4_prompt + user_prompt_base
+        ]
+        
+        for i in range(1, 5):
+            prompt_key = f"raw_prompt_subproblem{i}"
+            user_prompt = user_prompts[i - 1]
+            
+            new_messages = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            row_dict[prompt_key] = new_messages
+        
+        # Add ground truth to reward_model if it exists
+        if 'reward_model' not in row_dict:
+            row_dict['reward_model'] = {}
+        row_dict['reward_model']['ground_truth_sub1'] = a_1
+        row_dict['reward_model']['ground_truth_sub2'] = a_2
+        row_dict['reward_model']['ground_truth_sub3'] = a_3
+        row_dict['reward_model']['ground_truth_sub4'] = a_4
+    
+    def _process_ts_v5(self, row_dict: dict, messages: list, raw_prompt: str):
+        """Process ts_version v5: Add all subproblems in one prompt."""
+        if self.subproblems_dict is None:
+            return
+        
+        problem_id = row_dict.get('problem_id')
+        if problem_id is None:
+            return
+        
+        problem_id_str = str(problem_id)
+        if problem_id_str not in self.subproblems_dict:
+            return
+        
+        subproblem_data = self.subproblems_dict[problem_id_str]
+        problem_statement = subproblem_data.get('problem_statement', "")
+        q_1 = subproblem_data.get('question_1', {}).get('statement', "")
+        q_2 = subproblem_data.get('question_2', {}).get('statement', "")
+        q_3 = subproblem_data.get('question_3', {}).get('statement', "")
+        q_4 = subproblem_data.get('question_4', {}).get('statement', "")
+        a_1 = subproblem_data.get('question_1', {}).get('ground_truth', "")
+        a_2 = subproblem_data.get('question_2', {}).get('ground_truth', "")
+        a_3 = subproblem_data.get('question_3', {}).get('ground_truth', "")
+        a_4 = subproblem_data.get('question_4', {}).get('ground_truth', "")
+        
+        # sys_prompt = """You are a helpful math problem solver. Solve the following math problems efficiently and clearly. Please reason step by step, and put your final answer within \\boxed{answer}."""
+        sys_prompt = messages[0]['content']
+        statement_prompt = f"Problem Statement: {problem_statement}\n\n"
+        subproblem1_prompt = f"Subproblem 1: {q_1}\n"
+        subproblem2_prompt = f"Subproblem 2: {q_2}\n"
+        subproblem3_prompt = f"Subproblem 3: {q_3}\n"
+        subproblem4_prompt = f"Subproblem 4: {q_4}\n"
+
+        user_prompt = f"""{statement_prompt}{subproblem1_prompt}{subproblem2_prompt}{subproblem3_prompt}{subproblem4_prompt}Please solve all 4 subproblems in order. For each subproblem, start your response with **Subproblem k** (where k is the subproblem number), show your reasoning, and provide your final answer in \\boxed{{answer}}."""
+        # user_prompt = f"""{statement_prompt}{subproblem1_prompt}{subproblem2_prompt}{subproblem3_prompt}{subproblem4_prompt}INSTRUCTIONS:
+        # Solve all 4 subproblems in order following this EXACT format:
+        # **Subproblem 1**:
+        # [Your reasoning here]
+        # Final answer: \\boxed{{answer1}}
+        # **Subproblem 2**:
+        # [Your reasoning here]
+        # Final answer: \\boxed{{answer2}}
+        # **Subproblem 3**:
+        # [Your reasoning here]
+        # Final answer: \\boxed{{answer3}}
+        # **Subproblem 4**:
+        # [Your reasoning here]
+        # Final answer: \\boxed{{answer4}}. CRITICAL: Your response MUST end immediately after \\boxed{{answer4}}. Do NOT write anything else after that - no summaries, no repeated answers, no extra comments. Just stop."""
+        # Build new messages
+        new_messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        row_dict['raw_prompt_subproblems'] = new_messages
+        
+        # Add ground truth to reward_model if it exists
+        if 'reward_model' not in row_dict:
+            row_dict['reward_model'] = {}
+        row_dict['reward_model']['ground_truth_sub1'] = a_1
+        row_dict['reward_model']['ground_truth_sub2'] = a_2
+        row_dict['reward_model']['ground_truth_sub3'] = a_3
+        row_dict['reward_model']['ground_truth_sub4'] = a_4
 
     def __getstate__(self):
         if not self.serialize_dataset:
