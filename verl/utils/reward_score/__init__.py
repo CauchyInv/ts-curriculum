@@ -41,13 +41,18 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
-    if data_source == "openai/gsm8k":
+    if data_source:
+        # from . import math_reward
+        # res = math_reward.compute_score(solution_str, ground_truth)
+        # from . import math_verify
+        # res = math_verify.compute_score(solution_str, ground_truth)
+        from . import prime_math_refine
+        res = prime_math_refine.compute_score(solution_str, ground_truth)
+    elif data_source == "openai/gsm8k":
         from . import gsm8k
-
         res = gsm8k.compute_score(solution_str, ground_truth)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
         from . import math_reward
-
         res = math_reward.compute_score(solution_str, ground_truth)
         # [Optional] Math-Verify Integration
         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
@@ -104,7 +109,33 @@ def default_compute_score(
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
     else:
-        raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
+        print(f"data_source: {data_source}")
+        from . import prime_math
+
+        res = prime_math.compute_score(solution_str, ground_truth)
+        # For unhandled data sources, try to use math_verify if it's a math problem
+
+        # try:
+        #     from . import math_verify
+            
+        #     # Handle ground_truth if it's a list
+        #     if isinstance(ground_truth, list):
+        #         gt_str = ground_truth[0] if ground_truth else ""
+        #     else:
+        #         gt_str = str(ground_truth)
+        #     res = math_verify.compute_score(solution_str, gt_str)
+        # except ImportError as e:
+        #     raise NotImplementedError(
+        #         f"Reward function is not implemented for {data_source=}. "
+        #         "Math-Verify is not installed. Please install it by running `pip install math-verify`."
+        #     )
+        # except Exception as e:
+        #     # If math_verify fails, fall back to raising NotImplementedError
+        #     print(f"[DEBUG DEFAULT_COMPUTE_SCORE] Exception in math_verify: {e}")
+        #     raise NotImplementedError(
+        #         f"Reward function is not implemented for {data_source=}. "
+        #         f"Attempted to use math_verify but it failed: {e}"
+        #     )
 
     if isinstance(res, dict):
         return res
