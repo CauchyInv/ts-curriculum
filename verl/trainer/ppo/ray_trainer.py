@@ -795,39 +795,125 @@ class RayPPOTrainer:
                 mixed_subproblem_indices.extend(current_subproblem_indices)
             
         elif "raw_prompt_subproblems" in batch.non_tensor_batch:
-            # v5: Mix subproblems (all-in-one) and raw prompts
-            sub_n = 8
-            
-            mixed_raw_prompts = []
-            mixed_reward_models = []
-            teacher_student_mixed_flags = []
             subproblems_prompts = batch.non_tensor_batch["raw_prompt_subproblems"]
-            
-            # Get reward_model from batch if it exists
             reward_models = batch.non_tensor_batch.get("reward_model", None)
-            
-            for i in range(batch_size):
-                original_messages = original_raw_prompts[i]
-                original_reward_model = reward_models[i] if reward_models is not None else {}
-                
-                if old_rewards is not None and old_rewards[i].item()!= 0.0:
-                    # If old_reward == 1, use only raw (original messages)
-                    current_messages = [original_messages] * n
-                    current_flags = [False] * n  # All original (in_state_0)
-                else:
-                    # Mix subproblems and raw
-                    subproblems_messages = subproblems_prompts[i]
-                    current_messages = [subproblems_messages] * sub_n + [original_messages] * (n - sub_n)
-                    current_flags = [True] * sub_n + [False] * (n - sub_n)  # subproblems=True, original=False
-                
-                # For v5, all rollouts use the same reward_model (with all ground_truth_subX fields)
-                # This is used by truncate_response_by_subproblem_correctness to check subproblem correctness
-                # No need to set different ground_truth for different rollouts
-                current_reward_models = [original_reward_model.copy() for _ in range(n)]
-                
-                mixed_raw_prompts.extend(current_messages)
-                mixed_reward_models.extend(current_reward_models)
-                teacher_student_mixed_flags.extend(current_flags)
+
+            # v7 supports richer per-rollout mixing. Keep v5 behavior unchanged.
+            if self.ts_version == "v7":
+                v7_t_mix_mode = str(self.config.data.get("v7_t_mix_mode", "legacy_sub8")).lower()
+                v7_prompt_mode = str(self.config.data.get("v7_prompt_mode", "explicit_t")).lower()
+                v7_1_problem_match = str(self.config.data.get("v7_1_problem_match", "v7")).lower()
+
+                mixed_raw_prompts = []
+                mixed_reward_models = []
+                teacher_student_mixed_flags = []
+                v7_t_values = []
+                v7_prompt_mode_values = []
+
+                prompt_keys = {
+                    1: "raw_prompt_subproblems_t1_unified" if v7_prompt_mode == "unified" else "raw_prompt_subproblems_t1",
+                    2: "raw_prompt_subproblems_t2_unified" if v7_prompt_mode == "unified" else "raw_prompt_subproblems_t2",
+                    3: "raw_prompt_subproblems_t3_unified" if v7_prompt_mode == "unified" else "raw_prompt_subproblems_t3",
+                    4: "raw_prompt_subproblems_t4_unified" if v7_prompt_mode == "unified" else "raw_prompt_subproblems_t4",
+                }
+
+                prompt_arrays = {}
+                for t in [1, 2, 3, 4]:
+                    key = prompt_keys[t]
+                    prompt_arrays[t] = batch.non_tensor_batch.get(key, None)
+
+                for i in range(batch_size):
+                    original_messages = original_raw_prompts[i]
+                    original_reward_model = reward_models[i] if reward_models is not None else {}
+                    if not isinstance(original_reward_model, dict):
+                        original_reward_model = (
+                            original_reward_model.__dict__ if hasattr(original_reward_model, "__dict__") else {}
+                        )
+
+                    if v7_t_mix_mode == "balanced_2222" and n == 8:
+                        t_plan = [4, 4, 3, 3, 2, 2, 1, 1]
+                    elif v7_t_mix_mode == "balanced_2222":
+                        base = n // 4
+                        rem = n % 4
+                        t_plan = [4] * base + [3] * base + [2] * base + [1] * base
+                        t_plan.extend([4, 3, 2, 1][:rem])
+                    else:
+                        # Legacy: all v7 mixed samples use full 4-problem prompt.
+                        t_plan = [4] * n
+
+                    gt_orig = original_reward_model.get("ground_truth", "")
+                    gt_sub1 = original_reward_model.get("ground_truth_sub1", gt_orig)
+                    gt_sub2 = original_reward_model.get("ground_truth_sub2", gt_orig)
+                    gt_sub3 = original_reward_model.get("ground_truth_sub3", gt_orig)
+                    gt_sub4 = original_reward_model.get("ground_truth_sub4", gt_orig)
+                    gt_all = [gt_sub1, gt_sub2, gt_sub3, gt_sub4]
+
+                    for t in t_plan:
+                        t = int(t)
+                        if t == 1 and v7_1_problem_match == "grpo":
+                            # Match GRPO distribution for the 1-problem branch.
+                            current_messages = original_messages
+                            current_flag = False
+                            rm_variant = original_reward_model.copy()
+                            prompt_mode_value = "grpo"
+                        else:
+                            prompt_arr = prompt_arrays.get(t, None)
+                            if prompt_arr is not None:
+                                current_messages = prompt_arr[i]
+                            else:
+                                current_messages = subproblems_prompts[i]
+                            current_flag = True
+                            prompt_mode_value = v7_prompt_mode
+
+                            q_start = 5 - t  # original subproblem index start (1-based)
+                            selected_gt = gt_all[q_start - 1:4]
+                            rm_variant = original_reward_model.copy()
+                            for local_idx in [1, 2, 3, 4]:
+                                if local_idx <= t:
+                                    rm_variant[f"ground_truth_sub{local_idx}"] = selected_gt[local_idx - 1]
+                                else:
+                                    rm_variant[f"ground_truth_sub{local_idx}"] = ""
+                            rm_variant["num_problems"] = t
+                            rm_variant["v7_q_start"] = q_start
+                            rm_variant["v7_t"] = t
+                            rm_variant["v7_prompt_mode"] = prompt_mode_value
+                            rm_variant["ground_truth"] = selected_gt[-1] if len(selected_gt) > 0 else gt_orig
+
+                        mixed_raw_prompts.append(current_messages)
+                        mixed_reward_models.append(rm_variant)
+                        teacher_student_mixed_flags.append(current_flag)
+                        v7_t_values.append(t)
+                        v7_prompt_mode_values.append(prompt_mode_value)
+            else:
+                # v5: Mix subproblems (all-in-one) and raw prompts
+                sub_n = 8
+
+                mixed_raw_prompts = []
+                mixed_reward_models = []
+                teacher_student_mixed_flags = []
+
+                for i in range(batch_size):
+                    original_messages = original_raw_prompts[i]
+                    original_reward_model = reward_models[i] if reward_models is not None else {}
+
+                    if old_rewards is not None and old_rewards[i].item()!= 0.0:
+                        # If old_reward == 1, use only raw (original messages)
+                        current_messages = [original_messages] * n
+                        current_flags = [False] * n  # All original (in_state_0)
+                    else:
+                        # Mix subproblems and raw
+                        subproblems_messages = subproblems_prompts[i]
+                        current_messages = [subproblems_messages] * sub_n + [original_messages] * (n - sub_n)
+                        current_flags = [True] * sub_n + [False] * (n - sub_n)  # subproblems=True, original=False
+
+                    # For v5, all rollouts use the same reward_model (with all ground_truth_subX fields)
+                    # This is used by truncate_response_by_subproblem_correctness to check subproblem correctness
+                    # No need to set different ground_truth for different rollouts
+                    current_reward_models = [original_reward_model.copy() for _ in range(n)]
+
+                    mixed_raw_prompts.extend(current_messages)
+                    mixed_reward_models.extend(current_reward_models)
+                    teacher_student_mixed_flags.extend(current_flags)
         
         # If mixing was performed, create and return a DataProto with the mixed raw_prompt
         if mixed_raw_prompts is not None:
@@ -847,6 +933,11 @@ class RayPPOTrainer:
             # v4: subproblem_index 0=原题, 1..4=subproblem1..4
             if mixed_subproblem_indices is not None and len(mixed_subproblem_indices) > 0:
                 non_tensor_batch_dict["subproblem_index"] = np.array(mixed_subproblem_indices, dtype=np.int32)
+            if self.ts_version == "v7":
+                if 'v7_t_values' in locals() and len(v7_t_values) > 0:
+                    non_tensor_batch_dict["v7_t"] = np.array(v7_t_values, dtype=np.int32)
+                if 'v7_prompt_mode_values' in locals() and len(v7_prompt_mode_values) > 0:
+                    non_tensor_batch_dict["v7_prompt_mode"] = np.array(v7_prompt_mode_values, dtype=object)
             
             # Add problem_id: expand original problem_id to match mixed_raw_prompts order
             if "problem_id" in batch.non_tensor_batch:
@@ -1280,21 +1371,96 @@ class RayPPOTrainer:
             
             # Filter non-original problems (subproblem_correct_count is not None)
             non_original_counts = [count for count in subproblem_correct_counts if count is not None]
-            
-            # Compute metrics
             extract_failed_count = sum(1 for count in non_original_counts if count == -1)
-            subproblem_0_solved = sum(1 for count in non_original_counts if count == 0)
-            subproblem_1_solved = sum(1 for count in non_original_counts if count >= 1)
-            subproblem_2_solved = sum(1 for count in non_original_counts if count >= 2)
-            subproblem_3_solved = sum(1 for count in non_original_counts if count >= 3)
-            subproblem_4_solved = sum(1 for count in non_original_counts if count >= 4)
-            
-            metrics['batch/extract_failed'] = extract_failed_count
-            metrics['batch/subproblem_0_solved'] = subproblem_0_solved
-            metrics['batch/subprpblem_1_solved'] = subproblem_1_solved
-            metrics['batch/subprpblem_2_solved'] = subproblem_2_solved
-            metrics['batch/subprpblem_3_solved'] = subproblem_3_solved
-            metrics['batch/subprpblem_4_solved'] = subproblem_4_solved
+
+            # v7 metrics:
+            # - Keep batch/subproblem_0..4_solved but reinterpret as absolute question index solved counts.
+            #   0 means parse succeeded but solved none (k==0).
+            # - Add batch/v7_t{t}_k{kk}_count (kk=-1..4).
+            if self.ts_version == "v7":
+                reward_models_arr = batch.non_tensor_batch.get("reward_model", None)
+                v7_t_arr = batch.non_tensor_batch.get("v7_t", None)
+                if isinstance(v7_t_arr, np.ndarray):
+                    v7_t_arr = v7_t_arr.tolist()
+                elif v7_t_arr is not None and not isinstance(v7_t_arr, list):
+                    v7_t_arr = list(v7_t_arr)
+
+                abs_solved_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+                t_k_counts = {(t, kk): 0 for t in [1, 2, 3, 4] for kk in [-1, 0, 1, 2, 3, 4]}
+
+                for idx, k_val in enumerate(subproblem_correct_counts):
+                    if k_val is None:
+                        continue
+                    try:
+                        k_int = int(k_val)
+                    except Exception:
+                        continue
+
+                    # Determine t and absolute question start index.
+                    t_int = None
+                    if v7_t_arr is not None and idx < len(v7_t_arr) and v7_t_arr[idx] is not None:
+                        try:
+                            t_int = int(v7_t_arr[idx])
+                        except Exception:
+                            t_int = None
+                    q_start = None
+                    if reward_models_arr is not None and idx < len(reward_models_arr):
+                        rm = reward_models_arr[idx]
+                        if not isinstance(rm, dict):
+                            rm = rm.__dict__ if hasattr(rm, "__dict__") else {}
+                        if t_int is None:
+                            try:
+                                t_int = int(rm.get("num_problems", 4))
+                            except Exception:
+                                t_int = 4
+                        try:
+                            q_start = int(rm.get("v7_q_start", 5 - int(t_int)))
+                        except Exception:
+                            q_start = None
+                    if t_int is None:
+                        t_int = 4
+                    t_int = max(1, min(4, int(t_int)))
+                    if q_start is None:
+                        q_start = 5 - t_int
+                    q_start = max(1, min(4, int(q_start)))
+
+                    # New requested metric: per-t per-k counts.
+                    if (t_int, k_int) in t_k_counts:
+                        t_k_counts[(t_int, k_int)] += 1
+
+                    # Absolute subproblem solved counts:
+                    # k == 0 means parse succeeded but no subproblem solved.
+                    if k_int == 0:
+                        abs_solved_counts[0] += 1
+                    elif k_int > 0:
+                        solved_until = min(4, q_start + k_int - 1)
+                        for abs_q in range(q_start, solved_until + 1):
+                            abs_solved_counts[abs_q] += 1
+
+                metrics['batch/extract_failed'] = extract_failed_count
+                metrics['batch/subproblem_0_solved'] = abs_solved_counts[0]
+                metrics['batch/subproblem_1_solved'] = abs_solved_counts[1]
+                metrics['batch/subproblem_2_solved'] = abs_solved_counts[2]
+                metrics['batch/subproblem_3_solved'] = abs_solved_counts[3]
+                metrics['batch/subproblem_4_solved'] = abs_solved_counts[4]
+
+                for t in [1, 2, 3, 4]:
+                    for kk in [-1, 0, 1, 2, 3, 4]:
+                        metrics[f"batch/v7_t{t}_k{kk}_count"] = t_k_counts[(t, kk)]
+            else:
+                # Legacy behavior for v5 / old v7 setup.
+                subproblem_0_solved = sum(1 for count in non_original_counts if count == 0)
+                subproblem_1_solved = sum(1 for count in non_original_counts if count >= 1)
+                subproblem_2_solved = sum(1 for count in non_original_counts if count >= 2)
+                subproblem_3_solved = sum(1 for count in non_original_counts if count >= 3)
+                subproblem_4_solved = sum(1 for count in non_original_counts if count >= 4)
+
+                metrics['batch/extract_failed'] = extract_failed_count
+                metrics['batch/subproblem_0_solved'] = subproblem_0_solved
+                metrics['batch/subproblem_1_solved'] = subproblem_1_solved
+                metrics['batch/subproblem_2_solved'] = subproblem_2_solved
+                metrics['batch/subproblem_3_solved'] = subproblem_3_solved
+                metrics['batch/subproblem_4_solved'] = subproblem_4_solved
             
             # Track problems with k=4 (all subproblems correct)
             # Note: k=4 means all 4 subproblems are correct, even though truncated=False for k=4
@@ -1324,7 +1490,7 @@ class RayPPOTrainer:
             metrics['global/total_solved_medium_full_subproblem'] = len(self.problems_solved_medium_full_subproblem)
             print(f"total_solved_hard_full_subproblem: {self.problems_solved_hard_full_subproblem}")
             print(f"total_solved_medium_full_subproblem: {self.problems_solved_medium_full_subproblem}")
-        
+
         print(f"problem_solved_in_state_0: {self.problems_solved_in_state_0}")
         print(f"problem_solved_in_state_0_hard: {self.problems_solved_in_state_0_hard}")
         print(f"problem_solved_in_state_0_medium: {self.problems_solved_in_state_0_medium}")
@@ -2169,6 +2335,14 @@ class RayPPOTrainer:
                     )
                     # Replace raw_prompt, reward_model, and teacher_student_mixed with mixed versions (which have correct order)
                     gen_batch.non_tensor_batch["raw_prompt"] = mixed_data.non_tensor_batch["raw_prompt"]
+                    if "reward_model" in mixed_data.non_tensor_batch:
+                        gen_batch.non_tensor_batch["reward_model"] = mixed_data.non_tensor_batch["reward_model"]
+                    if "teacher_student_mixed" in mixed_data.non_tensor_batch:
+                        gen_batch.non_tensor_batch["teacher_student_mixed"] = mixed_data.non_tensor_batch["teacher_student_mixed"]
+                    if "v7_t" in mixed_data.non_tensor_batch:
+                        gen_batch.non_tensor_batch["v7_t"] = mixed_data.non_tensor_batch["v7_t"]
+                    if "v7_prompt_mode" in mixed_data.non_tensor_batch:
+                        gen_batch.non_tensor_batch["v7_prompt_mode"] = mixed_data.non_tensor_batch["v7_prompt_mode"]
                     gen_batch_output = gen_batch
                 else:
                     # No mixing, repeat as usual
@@ -2207,12 +2381,26 @@ class RayPPOTrainer:
                         from verl.trainer.ppo.own_utils import mark_response_tokens_by_subproblem_correctness
                         # Get USE_SUBPROBLEM_PROMPT from config, default to False
                         use_subproblem_prompt = self.config.data.get("use_subproblem_prompt", False)
+                        v7_format_mode = self.config.data.get("v7_format_mode", "subproblem")
+                        v7_num_problems = self.config.data.get("v7_num_problems", 4)
+                        if v7_num_problems == "auto":
+                            v7_num_problems = 4
+                        try:
+                            v7_num_problems = int(v7_num_problems)
+                        except Exception:
+                            v7_num_problems = 4
+                        v7_require_strict_eos = self.config.data.get("v7_require_strict_eos", True)
+                        v7_parse_fail_policy = self.config.data.get("v7_parse_fail_policy", "hard")
                         gen_batch_output = mark_response_tokens_by_subproblem_correctness(
                             gen_batch_output=gen_batch_output,
                             mixed_data=mixed_data,
                             tokenizer=self.tokenizer,
                             reward_fn=self.reward_fn,
-                            use_subproblem_prompt=use_subproblem_prompt
+                            use_subproblem_prompt=use_subproblem_prompt,
+                            format_mode=v7_format_mode,
+                            num_problems=v7_num_problems,
+                            require_strict_eos=v7_require_strict_eos,
+                            parse_fail_policy=v7_parse_fail_policy,
                         )
                         
                         # Debug: Print token marking statistics (only for teacher_student_mixed samples)
@@ -2335,12 +2523,15 @@ class RayPPOTrainer:
                     # Update reward_model and teacher_student_mixed if they exist in mixed_data
                     # This ensures reward_model and teacher_student_mixed order matches the mixed prompts order
                     if mixed_data is not None:
-                        # if "reward_model" in mixed_data.non_tensor_batch:
-                        #     if self.ts_version == "v4":
-                        #         batch.non_tensor_batch["reward_model"] = mixed_data.non_tensor_batch["reward_model"]
+                        if "reward_model" in mixed_data.non_tensor_batch:
+                            batch.non_tensor_batch["reward_model"] = mixed_data.non_tensor_batch["reward_model"]
                                     
                         if "teacher_student_mixed" in mixed_data.non_tensor_batch:
                             batch.non_tensor_batch["teacher_student_mixed"] = mixed_data.non_tensor_batch["teacher_student_mixed"]
+                        if "v7_t" in mixed_data.non_tensor_batch:
+                            batch.non_tensor_batch["v7_t"] = mixed_data.non_tensor_batch["v7_t"]
+                        if "v7_prompt_mode" in mixed_data.non_tensor_batch:
+                            batch.non_tensor_batch["v7_prompt_mode"] = mixed_data.non_tensor_batch["v7_prompt_mode"]
                         if "subproblem_index" in mixed_data.non_tensor_batch:
                             batch.non_tensor_batch["subproblem_index"] = np.array(
                                 mixed_data.non_tensor_batch["subproblem_index"], dtype=np.int32
@@ -2548,6 +2739,8 @@ class RayPPOTrainer:
                                         # Get subproblem_correct_count (k values) for each sample
                                         subproblem_correct_count = batch.non_tensor_batch.get("subproblem_correct_count", None)
                                         token_correctness_mask = batch.batch.get("token_correctness_mask", None)
+                                        reward_models = batch.non_tensor_batch.get("reward_model", None)
+                                        v7_reward_map_mode = str(self.config.data.get("v7_reward_map_mode", "legacy_k")).lower()
                                         
                                         # reward_tensor shape: (batch_size, response_length)
                                         # reward_tensor only contains response part, not prompt
@@ -2573,14 +2766,34 @@ class RayPPOTrainer:
                                                 if k == -1 or k == 0:
                                                     reward_value = 0.0
                                                 elif 1 <= k <= 4:
-                                                    if k == 1:
-                                                        reward_value = 0.1
-                                                    if k == 2:
-                                                        reward_value = 0.2
-                                                    if k == 3:
-                                                        reward_value = 0.5
-                                                    if k == 4:
-                                                        reward_value = 1.0
+                                                    if v7_reward_map_mode == "absolute_difficulty":
+                                                        q_start = 1
+                                                        if reward_models is not None and idx < len(reward_models):
+                                                            rm = reward_models[idx]
+                                                            if not isinstance(rm, dict):
+                                                                rm = rm.__dict__ if hasattr(rm, "__dict__") else {}
+                                                            try:
+                                                                q_start = int(rm.get("v7_q_start", 1))
+                                                            except Exception:
+                                                                q_start = 1
+                                                        abs_q_idx = max(1, min(4, q_start + int(k) - 1))
+                                                        if abs_q_idx == 1:
+                                                            reward_value = 0.1
+                                                        elif abs_q_idx == 2:
+                                                            reward_value = 0.2
+                                                        elif abs_q_idx == 3:
+                                                            reward_value = 0.5
+                                                        else:
+                                                            reward_value = 1.0
+                                                    else:
+                                                        if k == 1:
+                                                            reward_value = 0.1
+                                                        if k == 2:
+                                                            reward_value = 0.2
+                                                        if k == 3:
+                                                            reward_value = 0.5
+                                                        if k == 4:
+                                                            reward_value = 1.0
                                                 else:
                                                     # Invalid k value, skip this sample
                                                     continue
@@ -2637,19 +2850,8 @@ class RayPPOTrainer:
                                         print(f"[v7_debug] Reward setting: Processing {total_mixed_samples} teacher_student_mixed samples")
                                         for k in [-1, 0, 1, 2, 3, 4]:
                                             count = k_counts[k]
-                                            if k == -1 or k == 0:
-                                                reward_value = 0.0
-                                            else:
-                                                if k == 1:
-                                                    reward_value = 0.1
-                                                if k == 2:
-                                                    reward_value = 0.2
-                                                if k == 3:
-                                                    reward_value = 0.5
-                                                if k == 4:
-                                                    reward_value = 1.0
                                             if count > 0:
-                                                print(f"[v7_reward] Set reward as {reward_value} based on k={k} for {count} teacher_student_mixed samples "
+                                                print(f"[v7_reward] mode={v7_reward_map_mode}, k={k}, count={count} "
                                                       f"({count/total_mixed_samples*100:.1f}%)")
                                         
                                         # Debug: Print reward distribution statistics

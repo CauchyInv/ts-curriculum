@@ -1933,7 +1933,11 @@ def mark_response_tokens_by_subproblem_correctness(
     mixed_data: Any,
     tokenizer: Any,
     reward_fn: Any,
-    use_subproblem_prompt: bool = False
+    use_subproblem_prompt: bool = False,
+    format_mode: str = "subproblem",
+    num_problems: int = 4,
+    require_strict_eos: bool = True,
+    parse_fail_policy: str = "hard",
 ) -> Any:
     """
     For teacher_student v7: Mark tokens in responses for teacher_student_mixed=True samples
@@ -1954,6 +1958,10 @@ def mark_response_tokens_by_subproblem_correctness(
         use_subproblem_prompt: If True, the chat template adds "Assistant:**Subproblem 1**:\n",
             so the model response doesn't include "**Subproblem 1**:" marker. We need to add it
             before parsing.
+        format_mode: "subproblem" (legacy **Subproblem k**) or "pn" (<pN></pN> protocol).
+        num_problems: default number of problems for "pn" mode.
+        require_strict_eos: If True, enforce strict boxed->EOS check when all parts are correct.
+        parse_fail_policy: "hard" or "soft" for "pn" parser strictness.
     
     Returns:
         Modified gen_batch_output with token_correctness_mask in batch
@@ -1986,6 +1994,9 @@ def mark_response_tokens_by_subproblem_correctness(
     if reward_models is None:
         return gen_batch_output
     
+    format_mode = str(format_mode).lower()
+    parse_fail_policy = str(parse_fail_policy).lower()
+
     # Initialize token_correctness_mask: 1 for correct tokens, 0 for wrong tokens
     # For non-mixed samples, we'll set all tokens to 1 (default: treat as correct)
     response_length = responses.size(1)
@@ -2032,6 +2043,178 @@ def mark_response_tokens_by_subproblem_correctness(
             reward_model.get('ground_truth_sub3', ''),
             reward_model.get('ground_truth_sub4', '')
         ]
+
+        # New mode: generic <pN>...</pN> format for variable-K problems.
+        # Keep legacy "subproblem" logic untouched below.
+        if format_mode == "pn":
+            import re
+            response_text = response_text_original
+
+            sample_num_problems = num_problems
+            rm_k = reward_model.get("num_problems", None)
+            if rm_k is not None:
+                try:
+                    sample_num_problems = int(rm_k)
+                except Exception:
+                    pass
+            sample_num_problems = max(1, min(4, int(sample_num_problems)))
+            sample_ground_truths = ground_truths[:sample_num_problems]
+
+            parse_failed = False
+            parse_fail_reason = ""
+            parts = []
+            part_content_starts = []
+            part_content_ends = []
+            segment_start_chars = []
+            cursor = 0
+
+            for p_idx in range(1, sample_num_problems + 1):
+                open_pat = re.compile(rf"<p{p_idx}>", re.IGNORECASE)
+                close_pat = re.compile(rf"</p{p_idx}>", re.IGNORECASE)
+                m_open = open_pat.search(response_text, cursor)
+                if m_open is None:
+                    parse_failed = True
+                    parse_fail_reason = f"missing_open_p{p_idx}"
+                    break
+                m_close = close_pat.search(response_text, m_open.end())
+                if m_close is None:
+                    parse_failed = True
+                    parse_fail_reason = f"missing_close_p{p_idx}"
+                    break
+
+                # Strict mode: forbid non-whitespace prefix before <p1>.
+                if p_idx == 1 and parse_fail_policy == "hard":
+                    if response_text[:m_open.start()].strip():
+                        parse_failed = True
+                        parse_fail_reason = "non_whitespace_before_p1"
+                        break
+
+                segment_start_chars.append(m_open.start())
+                part_content_starts.append(m_open.end())
+                part_content_ends.append(m_close.start())
+                parts.append(response_text[m_open.end():m_close.start()].strip())
+                cursor = m_close.end()
+
+            if (not parse_failed) and parse_fail_policy == "hard":
+                # In hard mode, disallow additional <pN> tags after expected K parts.
+                if re.search(r"<\s*/?\s*p\d+\s*>", response_text[cursor:], re.IGNORECASE):
+                    parse_failed = True
+                    parse_fail_reason = "extra_p_tags_after_expected_k"
+
+            if parse_failed:
+                subproblem_correct_count[idx] = -1
+                token_correctness_mask[idx, :] = 0.0
+                print(f"[mark_v7_pn] idx={idx}, problem_id={problem_id}, k=-1, parse_failed={parse_fail_reason}")
+                continue
+
+            correct_flags = []
+            for part, gt in zip(parts, sample_ground_truths):
+                if not gt or str(gt).strip() == '':
+                    correct_flags.append(True)
+                    continue
+                answer_part = part.strip()
+                if not answer_part:
+                    correct_flags.append(False)
+                    continue
+                try:
+                    from verl.utils.reward_score.prime_math_refine import compute_score as prime_math_refine_score
+                    is_correct, _, _ = prime_math_refine_score(answer_part, str(gt))
+                except Exception:
+                    boxed_pattern = r'\\boxed\{([^}]+)\}'
+                    boxed_matches = list(re.finditer(boxed_pattern, answer_part))
+                    if boxed_matches:
+                        extracted_answer = boxed_matches[-1].group(1).strip()
+                        answer_clean = extracted_answer.lower().strip()
+                    else:
+                        answer_clean = answer_part.lower().strip()
+                    gt_clean = str(gt).strip().lower()
+                    is_correct = (gt_clean == answer_clean)
+                correct_flags.append(is_correct)
+
+            k = 0
+            for i in range(sample_num_problems):
+                if correct_flags[i]:
+                    k = i + 1
+                else:
+                    break
+            subproblem_correct_count[idx] = k
+
+            token_boundaries = []
+            for char_boundary in segment_start_chars + [len(response_text_original)]:
+                prefix_tokens = tokenizer.encode(
+                    response_text_original[:char_boundary],
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )[0]
+                token_boundaries.append(min(prefix_tokens.shape[0], response_length))
+
+            if k == 0:
+                token_correctness_mask[idx, :] = 0.0
+            elif 1 <= k < sample_num_problems:
+                wrong_start_token = token_boundaries[k]
+                token_correctness_mask[idx, wrong_start_token:] = 0.0
+            elif k == sample_num_problems and require_strict_eos:
+                # Strictly require last boxed in final part to be followed by EOS.
+                last_part_text = response_text[part_content_starts[-1]:part_content_ends[-1]]
+                boxed_start_idx = last_part_text.rfind("\\boxed")
+                if boxed_start_idx < 0:
+                    boxed_start_idx = last_part_text.rfind("\\fbox")
+                boxed_end_in_original = None
+                if boxed_start_idx >= 0:
+                    i = boxed_start_idx
+                    left_brace_idx = None
+                    right_brace_idx = None
+                    num_left_braces_open = 0
+                    while i < len(last_part_text):
+                        if last_part_text[i] == "{":
+                            num_left_braces_open += 1
+                            if left_brace_idx is None:
+                                left_brace_idx = i
+                        elif last_part_text[i] == "}":
+                            num_left_braces_open -= 1
+                            if num_left_braces_open == 0:
+                                right_brace_idx = i
+                                break
+                        i += 1
+                    if left_brace_idx is not None and right_brace_idx is not None:
+                        boxed_end_in_original = part_content_starts[-1] + right_brace_idx + 1
+
+                if boxed_end_in_original is None:
+                    token_correctness_mask[idx, :] = 0.0
+                    subproblem_correct_count[idx] = -1
+                    k = -1
+                else:
+                    prefix_tokens = tokenizer.encode(
+                        response_text_original[:boxed_end_in_original],
+                        add_special_tokens=False,
+                        return_tensors='pt'
+                    )[0]
+                    boxed_end_token_pos = min(prefix_tokens.shape[0], response_length)
+                    eos_token_id = tokenizer.eos_token_id
+                    if eos_token_id is None or boxed_end_token_pos >= response_length:
+                        token_correctness_mask[idx, :] = 0.0
+                        subproblem_correct_count[idx] = -1
+                        k = -1
+                    else:
+                        next_token_id = response_tensor[boxed_end_token_pos].item()
+                        if next_token_id != eos_token_id:
+                            token_correctness_mask[idx, :] = 0.0
+                            subproblem_correct_count[idx] = -1
+                            k = -1
+
+            # Mark padding after first EOS as wrong to avoid leaking pad tokens as "correct".
+            eos_token_id = tokenizer.eos_token_id
+            if eos_token_id is not None:
+                eos_positions = (response_tensor == eos_token_id).nonzero(as_tuple=True)[0]
+                if len(eos_positions) > 0:
+                    padding_start_token = eos_positions[0].item() + 1
+                    if padding_start_token < response_length:
+                        token_correctness_mask[idx, padding_start_token:] = 0.0
+
+            correct_tokens = token_correctness_mask[idx].sum().item()
+            total_tokens = token_correctness_mask[idx].numel()
+            print(f"[mark_v7_pn] idx={idx}, problem_id={problem_id}, k={subproblem_correct_count[idx]}, correct_tokens={correct_tokens}/{total_tokens}, K={sample_num_problems}")
+            continue
         
         # Handle use_subproblem_prompt case: if chat template adds "Assistant:**Subproblem 1**:\n",
         # the model response won't include "**Subproblem 1**:" marker, so we need to add it first
@@ -2369,4 +2552,3 @@ def mark_response_tokens_by_subproblem_correctness(
     gen_batch_output.non_tensor_batch["subproblem_correct_count"] = subproblem_correct_count
     
     return gen_batch_output
-

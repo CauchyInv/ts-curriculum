@@ -147,7 +147,14 @@ class RLHFDataset(Dataset):
         self.crafted_wrong_answer = config.get("crafted_wrong_answer", None)
         self.teacher_lemmas = config.get("teacher_lemmas", None)
         self.subproblems_dict = config.get("subproblems_dict", None)
-        self.subproblems_jsonl_path = "/hyk/algorithm_new/qinghua/yueyang/verl/data/subproblems.jsonl"
+        self.subproblems_jsonl_path = config.get("subproblems_jsonl_path", None)
+        # v7 format control: "subproblem" keeps original **Subproblem k** format,
+        # "pn" uses generic Problem N + <pN></pN> output protocol.
+        self.v7_format_mode = str(config.get("v7_format_mode", "subproblem")).lower()
+        self.v7_num_problems = config.get("v7_num_problems", "auto")
+        self.v7_t_mix_mode = str(config.get("v7_t_mix_mode", "legacy_sub8")).lower()
+        self.v7_prompt_mode = str(config.get("v7_prompt_mode", "explicit_t")).lower()
+        self.v7_1_problem_match = str(config.get("v7_1_problem_match", "v7")).lower()
         
         # Load subproblems_dict if jsonl_path is provided
         if self.subproblems_jsonl_path is not None and self.subproblems_dict is None:
@@ -753,35 +760,102 @@ Your task is to carefully analyze the provided solution, identify what is wrong 
         a_3 = subproblem_data.get('question_3', {}).get('ground_truth', "")
         a_4 = subproblem_data.get('question_4', {}).get('ground_truth', "")
         
-        # sys_prompt = """You are a helpful math problem solver. Solve the following math problems efficiently and clearly. Please reason step by step, and put your final answer within \\boxed{answer}."""
         sys_prompt = messages[0]['content']
         statement_prompt = f"Problem Statement: {problem_statement}\n\n"
-        subproblem1_prompt = f"Subproblem 1: {q_1}\n"
-        subproblem2_prompt = f"Subproblem 2: {q_2}\n"
-        subproblem3_prompt = f"Subproblem 3: {q_3}\n"
-        subproblem4_prompt = f"Subproblem 4: {q_4}\n"
+        prompts = [q_1, q_2, q_3, q_4]
+        non_empty_count = sum(1 for q in prompts if str(q).strip())
+        if self.v7_num_problems == "auto":
+            num_problems = non_empty_count if non_empty_count > 0 else 4
+        else:
+            try:
+                num_problems = int(self.v7_num_problems)
+            except Exception:
+                num_problems = 4
+        num_problems = max(1, min(4, num_problems))
 
-        user_prompt = f"""{statement_prompt}{subproblem1_prompt}{subproblem2_prompt}{subproblem3_prompt}{subproblem4_prompt}Please solve all 4 subproblems in order. For each subproblem, start your response with **Subproblem k** (where k is the subproblem number), show your reasoning, and provide your final answer in \\boxed{{answer}}."""
-        # user_prompt = f"""{statement_prompt}{subproblem1_prompt}{subproblem2_prompt}{subproblem3_prompt}{subproblem4_prompt}INSTRUCTIONS:
-        # Solve all 4 subproblems in order following this EXACT format:
-        # **Subproblem 1**:
-        # [Your reasoning here]
-        # Final answer: \\boxed{{answer1}}
-        # **Subproblem 2**:
-        # [Your reasoning here]
-        # Final answer: \\boxed{{answer2}}
-        # **Subproblem 3**:
-        # [Your reasoning here]
-        # Final answer: \\boxed{{answer3}}
-        # **Subproblem 4**:
-        # [Your reasoning here]
-        # Final answer: \\boxed{{answer4}}. CRITICAL: Your response MUST end immediately after \\boxed{{answer4}}. Do NOT write anything else after that - no summaries, no repeated answers, no extra comments. Just stop."""
+        # Keep v5 unchanged and keep v7 default mode unchanged.
+        format_mode = self.v7_format_mode if self.ts_version == "v7" else "subproblem"
+
+        if format_mode == "pn":
+            problem_blocks = "".join(
+                f"Problem {i + 1}: {prompts[i]}\n" for i in range(num_problems)
+            )
+            user_prompt = (
+                f"{statement_prompt}{problem_blocks}"
+                f"This task has {num_problems} problems.\n"
+                f"Please solve Problem 1 to Problem {num_problems} in order.\n"
+                f"Output MUST contain exactly {num_problems} blocks in this order:\n"
+                + "\n".join(f"<p{i}></p{i}>" for i in range(1, num_problems + 1))
+                + "\nFor each block <pN>...</pN>, include reasoning and end with final answer in \\boxed{answer}."
+            )
+        else:
+            subproblem1_prompt = f"Subproblem 1: {q_1}\n"
+            subproblem2_prompt = f"Subproblem 2: {q_2}\n"
+            subproblem3_prompt = f"Subproblem 3: {q_3}\n"
+            subproblem4_prompt = f"Subproblem 4: {q_4}\n"
+            user_prompt = (
+                f"{statement_prompt}{subproblem1_prompt}{subproblem2_prompt}{subproblem3_prompt}{subproblem4_prompt}"
+                "Please solve all 4 subproblems in order. For each subproblem, start your response with "
+                "**Subproblem k** (where k is the subproblem number), show your reasoning, and provide your final answer in \\boxed{answer}."
+            )
         # Build new messages
         new_messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt}
         ]
         row_dict['raw_prompt_subproblems'] = new_messages
+
+        # For v7, additionally prepare prompt variants for t in {1,2,3,4}
+        # so trainer can mix them within one rollout group.
+        if self.ts_version == "v7":
+            def _build_v7_messages_for_t(t: int, prompt_mode: str):
+                t = max(1, min(4, int(t)))
+                selected_prompts = prompts[4 - t:4]  # use the last t subproblems
+                if format_mode == "pn":
+                    problem_blocks = "".join(
+                        f"Problem {i + 1}: {selected_prompts[i]}\n" for i in range(t)
+                    )
+                    if prompt_mode == "unified":
+                        user_prompt_t = (
+                            f"{statement_prompt}{problem_blocks}"
+                            "Please solve all problems provided in order.\n"
+                            "Output should use block format <pN>...</pN>, where N indexes each provided problem.\n"
+                            "Do not output extra blocks beyond provided problems.\n"
+                            "For each block <pN>...</pN>, include reasoning and end with final answer in \\boxed{answer}."
+                        )
+                    else:
+                        user_prompt_t = (
+                            f"{statement_prompt}{problem_blocks}"
+                            f"This task has {t} problems.\n"
+                            f"Please solve Problem 1 to Problem {t} in order.\n"
+                            f"Output MUST contain exactly {t} blocks in this order:\n"
+                            + "\n".join(f"<p{i}></p{i}>" for i in range(1, t + 1))
+                            + "\nFor each block <pN>...</pN>, include reasoning and end with final answer in \\boxed{answer}."
+                        )
+                else:
+                    sub_blocks = "".join(
+                        f"Subproblem {i + 1}: {selected_prompts[i]}\n" for i in range(t)
+                    )
+                    if prompt_mode == "unified":
+                        user_prompt_t = (
+                            f"{statement_prompt}{sub_blocks}"
+                            "Please solve all provided subproblems in order.\n"
+                            "For each subproblem, start with **Subproblem k**, then provide reasoning and final answer in \\boxed{answer}."
+                        )
+                    else:
+                        user_prompt_t = (
+                            f"{statement_prompt}{sub_blocks}"
+                            f"Please solve all {t} subproblems in order. For each subproblem, start your response with "
+                            "**Subproblem k** (where k is the subproblem number), show your reasoning, and provide your final answer in \\boxed{answer}."
+                        )
+                return [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt_t},
+                ]
+
+            for t in [1, 2, 3, 4]:
+                row_dict[f"raw_prompt_subproblems_t{t}"] = _build_v7_messages_for_t(t, "explicit_t")
+                row_dict[f"raw_prompt_subproblems_t{t}_unified"] = _build_v7_messages_for_t(t, "unified")
         
         # Add ground truth to reward_model if it exists
         if 'reward_model' not in row_dict:
@@ -790,6 +864,7 @@ Your task is to carefully analyze the provided solution, identify what is wrong 
         row_dict['reward_model']['ground_truth_sub2'] = a_2
         row_dict['reward_model']['ground_truth_sub3'] = a_3
         row_dict['reward_model']['ground_truth_sub4'] = a_4
+        row_dict['reward_model']['num_problems'] = num_problems
 
     def __getstate__(self):
         if not self.serialize_dataset:
