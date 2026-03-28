@@ -2006,6 +2006,14 @@ def mark_response_tokens_by_subproblem_correctness(
     # Track how many subproblems were correct for each sample
     # None: original problem (non-mixed), -1: extraction failed, 0-4: number of correct subproblems
     subproblem_correct_count = np.full(batch_size, None, dtype=object)
+
+    # v8 helper fields:
+    # - subproblem_part_correctness_local: per-sample local part correctness (1/0, -1 parse-fail, -2 unused)
+    # - subproblem_part_token_mask: per-sample/local-part token span mask in response tokens
+    subproblem_part_correctness_local = np.full((batch_size, 4), -2, dtype=np.int32)
+    subproblem_part_token_mask = torch.zeros(
+        batch_size, 4, response_length, dtype=torch.float32, device=responses.device
+    )
     
     for idx in mixed_indices:
         idx = int(idx)
@@ -2063,8 +2071,6 @@ def mark_response_tokens_by_subproblem_correctness(
             parse_failed = False
             parse_fail_reason = ""
             parts = []
-            part_content_starts = []
-            part_content_ends = []
             segment_start_chars = []
             cursor = 0
 
@@ -2090,8 +2096,6 @@ def mark_response_tokens_by_subproblem_correctness(
                         break
 
                 segment_start_chars.append(m_open.start())
-                part_content_starts.append(m_open.end())
-                part_content_ends.append(m_close.start())
                 parts.append(response_text[m_open.end():m_close.start()].strip())
                 cursor = m_close.end()
 
@@ -2104,6 +2108,7 @@ def mark_response_tokens_by_subproblem_correctness(
             if parse_failed:
                 subproblem_correct_count[idx] = -1
                 token_correctness_mask[idx, :] = 0.0
+                subproblem_part_correctness_local[idx, :sample_num_problems] = -1
                 print(f"[mark_v7_pn] idx={idx}, problem_id={problem_id}, k=-1, parse_failed={parse_fail_reason}")
                 continue
 
@@ -2131,6 +2136,10 @@ def mark_response_tokens_by_subproblem_correctness(
                     is_correct = (gt_clean == answer_clean)
                 correct_flags.append(is_correct)
 
+            # Save per-part correctness for v8 (local indices 1..K).
+            for p_local in range(sample_num_problems):
+                subproblem_part_correctness_local[idx, p_local] = 1 if correct_flags[p_local] else 0
+
             k = 0
             for i in range(sample_num_problems):
                 if correct_flags[i]:
@@ -2148,6 +2157,13 @@ def mark_response_tokens_by_subproblem_correctness(
                 )[0]
                 token_boundaries.append(min(prefix_tokens.shape[0], response_length))
 
+            # Per-local-part token spans for v8: [start_of_<pN>, start_of_<pN+1>) with last to end.
+            for p_local in range(sample_num_problems):
+                start_tok = token_boundaries[p_local]
+                end_tok = token_boundaries[p_local + 1]
+                if 0 <= start_tok < end_tok <= response_length:
+                    subproblem_part_token_mask[idx, p_local, start_tok:end_tok] = 1.0
+
             if k == 0:
                 token_correctness_mask[idx, :] = 0.0
             elif 1 <= k < sample_num_problems:
@@ -2155,7 +2171,8 @@ def mark_response_tokens_by_subproblem_correctness(
                 token_correctness_mask[idx, wrong_start_token:] = 0.0
             elif k == sample_num_problems and require_strict_eos:
                 # Strictly require last boxed in final part to be followed by EOS.
-                last_part_text = response_text[part_content_starts[-1]:part_content_ends[-1]]
+                # Use extracted final part directly.
+                last_part_text = parts[-1]
                 boxed_start_idx = last_part_text.rfind("\\boxed")
                 if boxed_start_idx < 0:
                     boxed_start_idx = last_part_text.rfind("\\fbox")
@@ -2177,11 +2194,15 @@ def mark_response_tokens_by_subproblem_correctness(
                                 break
                         i += 1
                     if left_brace_idx is not None and right_brace_idx is not None:
-                        boxed_end_in_original = part_content_starts[-1] + right_brace_idx + 1
+                        # Find final part in original response; use rfind to avoid ambiguity.
+                        final_part_start = response_text_original.rfind(last_part_text)
+                        if final_part_start >= 0:
+                            boxed_end_in_original = final_part_start + right_brace_idx + 1
 
                 if boxed_end_in_original is None:
                     token_correctness_mask[idx, :] = 0.0
                     subproblem_correct_count[idx] = -1
+                    subproblem_part_correctness_local[idx, :sample_num_problems] = -1
                     k = -1
                 else:
                     prefix_tokens = tokenizer.encode(
@@ -2194,12 +2215,14 @@ def mark_response_tokens_by_subproblem_correctness(
                     if eos_token_id is None or boxed_end_token_pos >= response_length:
                         token_correctness_mask[idx, :] = 0.0
                         subproblem_correct_count[idx] = -1
+                        subproblem_part_correctness_local[idx, :sample_num_problems] = -1
                         k = -1
                     else:
                         next_token_id = response_tensor[boxed_end_token_pos].item()
                         if next_token_id != eos_token_id:
                             token_correctness_mask[idx, :] = 0.0
                             subproblem_correct_count[idx] = -1
+                            subproblem_part_correctness_local[idx, :sample_num_problems] = -1
                             k = -1
 
             # Mark padding after first EOS as wrong to avoid leaking pad tokens as "correct".
@@ -2550,5 +2573,9 @@ def mark_response_tokens_by_subproblem_correctness(
     
     # Add subproblem_correct_count to non_tensor_batch
     gen_batch_output.non_tensor_batch["subproblem_correct_count"] = subproblem_correct_count
-    
+
+    # Add v8 helper fields. These are no-ops for old branches unless consumed by v8 logic.
+    gen_batch_output.non_tensor_batch["subproblem_part_correctness_local"] = subproblem_part_correctness_local
+    gen_batch_output.batch["subproblem_part_token_mask"] = subproblem_part_token_mask
+
     return gen_batch_output

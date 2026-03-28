@@ -506,7 +506,7 @@ class RLHFDataset(Dataset):
             self._process_ts_v3(row_dict, messages, raw_prompt)
         elif self.ts_version == 'v4':
             self._process_ts_v4(row_dict, messages, raw_prompt)
-        elif self.ts_version == 'v5' or self.ts_version == 'v7':
+        elif self.ts_version == 'v5' or self.ts_version == 'v7' or self.ts_version == 'v8':
             self._process_ts_v5(row_dict, messages, raw_prompt)
     
     def _process_ts_v1(self, row_dict: dict, raw_prompt: str):
@@ -773,8 +773,8 @@ Your task is to carefully analyze the provided solution, identify what is wrong 
                 num_problems = 4
         num_problems = max(1, min(4, num_problems))
 
-        # Keep v5 unchanged and keep v7 default mode unchanged.
-        format_mode = self.v7_format_mode if self.ts_version == "v7" else "subproblem"
+        # Keep v5 unchanged and let v7/v8 share the switchable format stack.
+        format_mode = self.v7_format_mode if self.ts_version in ("v7", "v8") else "subproblem"
 
         if format_mode == "pn":
             problem_blocks = "".join(
@@ -805,9 +805,9 @@ Your task is to carefully analyze the provided solution, identify what is wrong 
         ]
         row_dict['raw_prompt_subproblems'] = new_messages
 
-        # For v7, additionally prepare prompt variants for t in {1,2,3,4}
+        # For v7/v8, additionally prepare prompt variants for t in {1,2,3,4}
         # so trainer can mix them within one rollout group.
-        if self.ts_version == "v7":
+        if self.ts_version in ("v7", "v8"):
             def _build_v7_messages_for_t(t: int, prompt_mode: str):
                 t = max(1, min(4, int(t)))
                 selected_prompts = prompts[4 - t:4]  # use the last t subproblems
