@@ -24,6 +24,7 @@ os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import logging
+import json
 import re
 import time
 from contextlib import nullcontext
@@ -140,6 +141,66 @@ class FSDPSFTTrainer:
             print(self.config)
 
         self.device_name = self.config.trainer.device
+        self._init_sample_dump_config()
+
+    def _init_sample_dump_config(self):
+        trainer_cfg = self.config.trainer
+        self.sft_samples_enable = bool(getattr(trainer_cfg, "sft_samples_enable", False))
+        self.sft_samples_max = int(getattr(trainer_cfg, "sft_samples_max", 128))
+        self.sft_samples_only_first_epoch = bool(getattr(trainer_cfg, "sft_samples_only_first_epoch", False))
+        default_dir = os.path.join(
+            "/hyk/algorithm_new/qinghua/yueyang/verl/rollout_samples_own",
+            str(trainer_cfg.experiment_name),
+        )
+        self.sft_samples_dir = str(getattr(trainer_cfg, "sft_samples_dir", default_dir))
+
+    @staticmethod
+    def _to_jsonable(obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().tolist()
+        if isinstance(obj, (list, tuple)):
+            return [FSDPSFTTrainer._to_jsonable(x) for x in obj]
+        if isinstance(obj, dict):
+            return {str(k): FSDPSFTTrainer._to_jsonable(v) for k, v in obj.items()}
+        if hasattr(obj, "item"):
+            try:
+                return obj.item()
+            except Exception:
+                return str(obj)
+        return obj
+
+    def _dump_validation_samples(self, epoch: int, global_step: int):
+        if not self.sft_samples_enable or self.device_mesh.get_rank() != 0:
+            return
+        if self.sft_samples_only_first_epoch and epoch > 0:
+            return
+
+        dataset = self.val_dataset
+        dataframe = getattr(dataset, "dataframe", None)
+        if dataframe is None:
+            return
+
+        out_dir = os.path.join(self.sft_samples_dir, f"epoch_{epoch + 1}", f"step_{global_step}")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "validation_samples.jsonl")
+
+        max_n = min(self.sft_samples_max, len(dataframe))
+        with open(out_path, "w", encoding="utf-8") as f:
+            for i in range(max_n):
+                row = dataframe.iloc[i].to_dict()
+                rec = {
+                    "index": i,
+                    "problem_id": row.get("problem_id"),
+                    "data_source": row.get("data_source"),
+                    "messages": row.get("messages"),
+                    "prompt": row.get("prompt"),
+                    "target": row.get("target"),
+                    "response": row.get("response"),
+                    "reference_solution": row.get("reference_solution"),
+                    "extra_info": row.get("extra_info"),
+                }
+                f.write(json.dumps(self._to_jsonable(rec), ensure_ascii=False) + "\n")
+        print(f"[SFT] Saved validation samples to: {out_path}")
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -791,6 +852,7 @@ class FSDPSFTTrainer:
                         metric = {"val/loss": val_loss.detach().item()}
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
+                        self._dump_validation_samples(epoch=epoch, global_step=global_step)
                     torch.distributed.barrier()
 
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):

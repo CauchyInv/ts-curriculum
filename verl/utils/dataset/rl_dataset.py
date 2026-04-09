@@ -856,6 +856,22 @@ Your task is to carefully analyze the provided solution, identify what is wrong 
             for t in [1, 2, 3, 4]:
                 row_dict[f"raw_prompt_subproblems_t{t}"] = _build_v7_messages_for_t(t, "explicit_t")
                 row_dict[f"raw_prompt_subproblems_t{t}_unified"] = _build_v7_messages_for_t(t, "unified")
+
+            # Additional single-question prompts (q1..q4) using original template style.
+            # These are used by v8 mix44444: 4x t4 curriculum + 4x q1 + 4x q2 + 4x q3 + 4x q4.
+            # Requested behavior:
+            # - q1/q2/q3: user prompt = problem_statement + question_i
+            # - q4: reuse the original dataset prompt directly to avoid subtle mismatch.
+            for abs_q_idx in [1, 2, 3]:
+                single_q = prompts[abs_q_idx - 1] if abs_q_idx - 1 < len(prompts) else ""
+                user_q = f"{statement_prompt}Problem: {single_q}".strip()
+                row_dict[f"raw_prompt_subproblems_q{abs_q_idx}_orig"] = [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": str(user_q)},
+                ]
+
+            # q4 uses exactly the original prompt/messages from parquet.
+            row_dict["raw_prompt_subproblems_q4_orig"] = copy.deepcopy(messages)
         
         # Add ground truth to reward_model if it exists
         if 'reward_model' not in row_dict:

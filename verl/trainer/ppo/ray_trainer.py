@@ -365,6 +365,18 @@ class RayPPOTrainer:
             else:
                 use_adaptive_flag = bool(use_adaptive_cfg)
             self.v8_use_adaptive = bool(self.ts_version == "v8" and use_adaptive_flag)
+            v8_mix44444_adaptive_cfg = self.config.data.get("v8_mix44444_adaptive", False)
+            if isinstance(v8_mix44444_adaptive_cfg, str):
+                v8_mix44444_adaptive_flag = v8_mix44444_adaptive_cfg.strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "y",
+                    "on",
+                }
+            else:
+                v8_mix44444_adaptive_flag = bool(v8_mix44444_adaptive_cfg)
+            self.v8_mix44444_adaptive = bool(self.ts_version == "v8" and v8_mix44444_adaptive_flag)
             self.student_answer_history = {}
             self.teacher_hint_dict = {}
             self.crafted_wrong_answer = {}
@@ -415,10 +427,14 @@ class RayPPOTrainer:
             self._global_subproblem_solved = {1: set(), 2: set(), 3: set(), 4: set()}
             # v8 adaptive curriculum state: problem_id -> current t (1..4), default starts at t=4.
             self._v8_problem_t_state = {}
+            # v8 mix44444 adaptive state:
+            # problem_id -> {1: bool(active), 2: bool(active), 3: bool(active)}
+            self._v8_mix44444_q_active = {}
         else:
             self.teacher_model = None
             self.ts_version = None
             self.v8_use_adaptive = False
+            self.v8_mix44444_adaptive = False
             self.student_answer_history = None
             self.teacher_hint_dict = None
             self.crafted_wrong_answer = None
@@ -436,6 +452,7 @@ class RayPPOTrainer:
             self.current_reward_dict_avg_in_state_0 = None
             self._global_subproblem_solved = None
             self._v8_problem_t_state = None
+            self._v8_mix44444_q_active = None
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -482,6 +499,22 @@ class RayPPOTrainer:
             # Keep insertion order and initialize to t=4.
             self._v8_problem_t_state = {pid: 4 for pid in dict.fromkeys(problem_ids_for_state)}
             print(f"[v8_adaptive] initialized state for {len(self._v8_problem_t_state)} problems at t=4")
+        if curri_method == "teacher_student" and self.v8_mix44444_adaptive:
+            problem_ids_for_mix44444 = []
+            try:
+                if hasattr(self.train_dataset, "dataframe") and "problem_id" in self.train_dataset.dataframe.column_names:
+                    problem_ids_for_mix44444 = [str(x) for x in self.train_dataset.dataframe["problem_id"]]
+            except Exception:
+                problem_ids_for_mix44444 = []
+            if len(problem_ids_for_mix44444) == 0:
+                problem_ids_for_mix44444 = [str(i) for i in range(len(self.train_dataset))]
+            self._v8_mix44444_q_active = {
+                pid: {1: True, 2: True, 3: True} for pid in dict.fromkeys(problem_ids_for_mix44444)
+            }
+            print(
+                f"[v8_mix44444_adaptive] initialized q1/q2/q3 active state for "
+                f"{len(self._v8_mix44444_q_active)} problems"
+            )
 
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
@@ -870,6 +903,7 @@ class RayPPOTrainer:
                 teacher_student_mixed_flags = []
                 v7_t_values = []
                 v7_prompt_mode_values = []
+                v8_mix_group_values = []
 
                 prompt_keys = {
                     1: "raw_prompt_subproblems_t1_unified" if v7_prompt_mode == "unified" else "raw_prompt_subproblems_t1",
@@ -882,6 +916,13 @@ class RayPPOTrainer:
                 for t in [1, 2, 3, 4]:
                     key = prompt_keys[t]
                     prompt_arrays[t] = batch.non_tensor_batch.get(key, None)
+                # Optional single-question original-template prompts for mix44444.
+                prompt_q_orig_arrays = {
+                    1: batch.non_tensor_batch.get("raw_prompt_subproblems_q1_orig", None),
+                    2: batch.non_tensor_batch.get("raw_prompt_subproblems_q2_orig", None),
+                    3: batch.non_tensor_batch.get("raw_prompt_subproblems_q3_orig", None),
+                    4: batch.non_tensor_batch.get("raw_prompt_subproblems_q4_orig", None),
+                }
 
                 for i in range(batch_size):
                     original_messages = original_raw_prompts[i]
@@ -945,6 +986,34 @@ class RayPPOTrainer:
                         rem = n % 8
                         t_plan = [4] * base + [3] * base + [2] * base + [1] * base + [0] * (4 * base)
                         t_plan.extend([4, 3, 2, 1, 0, 0, 0, 0][:rem])
+                    elif v7_t_mix_mode == "mix44444" and n == 20:
+                        # v8 mix44444:
+                        # - 4x t4 curriculum samples (mixed=True)
+                        # - 4x q1 + 4x q2 + 4x q3 + 4x q4 single-question samples (mixed=False)
+                        # Use negative sentinels -1..-4 for q1..q4 single-question branches.
+                        if self.ts_version == "v8" and self.v8_mix44444_adaptive and current_problem_id is not None:
+                            q_state = self._v8_mix44444_q_active.get(current_problem_id, None)
+                            if not isinstance(q_state, dict):
+                                q_state = {1: True, 2: True, 3: True}
+                                self._v8_mix44444_q_active[current_problem_id] = q_state
+                            active_q = [q for q in [1, 2, 3] if bool(q_state.get(q, True))]
+                            inactive_q_count = 3 - len(active_q)
+                            # Replace each removed qi block with 2x t4 + 2x q4.
+                            t4_count = 4 + 2 * inactive_q_count
+                            q4_count = 4 + 2 * inactive_q_count
+                            t_plan = [4] * t4_count
+                            for q in [1, 2, 3]:
+                                if q in active_q:
+                                    t_plan.extend([-q] * 4)
+                            t_plan.extend([-4] * q4_count)
+                        else:
+                            t_plan = [4, 4, 4, 4] + ([-1] * 4) + ([-2] * 4) + ([-3] * 4) + ([-4] * 4)
+                    elif v7_t_mix_mode == "mix44444":
+                        # Generalized ratio 1:1:1:1:1 across [t4, q1, q2, q3, q4].
+                        base = n // 5
+                        rem = n % 5
+                        t_plan = [4] * base + ([-1] * base) + ([-2] * base) + ([-3] * base) + ([-4] * base)
+                        t_plan.extend([4, -1, -2, -3, -4][:rem])
                     else:
                         # Legacy: all v7 mixed samples use full 4-problem prompt.
                         t_plan = [4] * n
@@ -958,12 +1027,30 @@ class RayPPOTrainer:
 
                     for t in t_plan:
                         t = int(t)
-                        if t == 0:
+                        mix_group_id = 0
+                        stored_t = t
+                        if t <= -1:
+                            # mix44444 single-question GRPO branches: q1..q4.
+                            abs_q = min(4, max(1, -t))
+                            prompt_arr_q = prompt_q_orig_arrays.get(abs_q, None)
+                            if prompt_arr_q is not None:
+                                current_messages = prompt_arr_q[i]
+                            else:
+                                current_messages = original_messages
+                            current_flag = False
+                            rm_variant = original_reward_model.copy()
+                            rm_variant["ground_truth"] = gt_all[abs_q - 1]
+                            rm_variant["v8_mix44444_group"] = abs_q
+                            prompt_mode_value = "grpo"
+                            mix_group_id = abs_q
+                            stored_t = 0
+                        elif t == 0:
                             # Explicit original branch (used by balanced_11114).
                             current_messages = original_messages
                             current_flag = False
                             rm_variant = original_reward_model.copy()
                             prompt_mode_value = "grpo"
+                            mix_group_id = 4  # original/full question bucket
                         elif (
                             t == 1
                             and v7_1_problem_match == "grpo"
@@ -975,6 +1062,7 @@ class RayPPOTrainer:
                             current_flag = False
                             rm_variant = original_reward_model.copy()
                             prompt_mode_value = "grpo"
+                            mix_group_id = 4
                         else:
                             prompt_arr = prompt_arrays.get(t, None)
                             if prompt_arr is not None:
@@ -1001,8 +1089,9 @@ class RayPPOTrainer:
                         mixed_raw_prompts.append(current_messages)
                         mixed_reward_models.append(rm_variant)
                         teacher_student_mixed_flags.append(current_flag)
-                        v7_t_values.append(t)
+                        v7_t_values.append(stored_t)
                         v7_prompt_mode_values.append(prompt_mode_value)
+                        v8_mix_group_values.append(mix_group_id)
             else:
                 # v5: Mix subproblems (all-in-one) and raw prompts
                 sub_n = 8
@@ -1057,6 +1146,8 @@ class RayPPOTrainer:
                     non_tensor_batch_dict["v7_t"] = np.array(v7_t_values, dtype=np.int32)
                 if 'v7_prompt_mode_values' in locals() and len(v7_prompt_mode_values) > 0:
                     non_tensor_batch_dict["v7_prompt_mode"] = np.array(v7_prompt_mode_values, dtype=object)
+                if 'v8_mix_group_values' in locals() and len(v8_mix_group_values) > 0:
+                    non_tensor_batch_dict["v8_mix_group"] = np.array(v8_mix_group_values, dtype=np.int32)
             
             # Add problem_id: expand original problem_id to match mixed_raw_prompts order
             if "problem_id" in batch.non_tensor_batch:
@@ -1585,6 +1676,73 @@ class RayPPOTrainer:
                     for kk in [-1, 0, 1, 2, 3, 4]:
                         metrics[f"batch/v7_t{t}_k{kk}_count"] = t_k_counts[(t, kk)]
 
+                # v8 mix44444 adaptive progression (next-step effect):
+                # For each problem and qi in {1,2,3}, if all 4 qi samples in this step
+                # have reward==1.0, mark qi inactive from next step.
+                if (
+                    self.ts_version == "v8"
+                    and self.v8_mix44444_adaptive
+                    and self._v8_mix44444_q_active is not None
+                    and str(self.config.data.get("v7_t_mix_mode", "")).lower() == "mix44444"
+                ):
+                    problem_ids_arr = batch.non_tensor_batch.get("problem_id", None)
+                    v8_mix_group_arr = batch.non_tensor_batch.get("v8_mix_group", None)
+
+                    if isinstance(problem_ids_arr, np.ndarray):
+                        problem_ids_list = [str(x) for x in problem_ids_arr.tolist()]
+                    elif problem_ids_arr is not None:
+                        problem_ids_list = [str(x) for x in list(problem_ids_arr)]
+                    else:
+                        problem_ids_list = []
+
+                    if isinstance(v8_mix_group_arr, np.ndarray):
+                        mix_group_list = [int(x) for x in v8_mix_group_arr.tolist()]
+                    elif v8_mix_group_arr is not None:
+                        mix_group_list = [int(x) for x in list(v8_mix_group_arr)]
+                    else:
+                        mix_group_list = []
+
+                    per_sample_reward = reward_tensor.sum(dim=-1)
+                    grouped_q_rewards = defaultdict(lambda: {1: [], 2: [], 3: []})
+                    total_len = min(len(problem_ids_list), len(mix_group_list), int(per_sample_reward.shape[0]))
+                    for idx in range(total_len):
+                        qid = int(mix_group_list[idx])
+                        if qid not in (1, 2, 3):
+                            continue
+                        pid = problem_ids_list[idx]
+                        grouped_q_rewards[pid][qid].append(float(per_sample_reward[idx].item()))
+
+                    deactivated = {1: 0, 2: 0, 3: 0}
+                    tol = 1e-6
+                    for pid, q_rewards_dict in grouped_q_rewards.items():
+                        if pid not in self._v8_mix44444_q_active:
+                            self._v8_mix44444_q_active[pid] = {1: True, 2: True, 3: True}
+                        for qid in [1, 2, 3]:
+                            if not self._v8_mix44444_q_active[pid].get(qid, True):
+                                continue
+                            rewards_q = q_rewards_dict.get(qid, [])
+                            if len(rewards_q) >= 4 and all(float(r) >= 1.0 - tol for r in rewards_q):
+                                self._v8_mix44444_q_active[pid][qid] = False
+                                deactivated[qid] += 1
+
+                    if sum(deactivated.values()) > 0:
+                        print(
+                            "[v8_mix44444_adaptive] deactivated this step: "
+                            f"q1={deactivated[1]}, q2={deactivated[2]}, q3={deactivated[3]}"
+                        )
+
+                    active_counts = {1: 0, 2: 0, 3: 0}
+                    for st in self._v8_mix44444_q_active.values():
+                        for qid in [1, 2, 3]:
+                            if bool(st.get(qid, True)):
+                                active_counts[qid] += 1
+                    metrics["global/v8_mix44444_active_q1_problems"] = active_counts[1]
+                    metrics["global/v8_mix44444_active_q2_problems"] = active_counts[2]
+                    metrics["global/v8_mix44444_active_q3_problems"] = active_counts[3]
+                    metrics["batch/v8_mix44444_deactivated_q1"] = deactivated[1]
+                    metrics["batch/v8_mix44444_deactivated_q2"] = deactivated[2]
+                    metrics["batch/v8_mix44444_deactivated_q3"] = deactivated[3]
+
                 # v8 adaptive progression (next-step effect):
                 # For each problem currently at t>1 in curriculum branch, if all its curriculum samples
                 # in this step satisfy k>=1 (first local part solved), move to t-1 from next step.
@@ -1728,6 +1886,15 @@ class RayPPOTrainer:
                 t_state_counts[t_key] += 1
             for t in [1, 2, 3, 4]:
                 metrics[f"global/problems_at_t{t}"] = t_state_counts[t]
+        if self.ts_version == "v8" and self.v8_mix44444_adaptive and self._v8_mix44444_q_active is not None:
+            active_counts = {1: 0, 2: 0, 3: 0}
+            for st in self._v8_mix44444_q_active.values():
+                for qid in [1, 2, 3]:
+                    if bool(st.get(qid, True)):
+                        active_counts[qid] += 1
+            metrics["global/v8_mix44444_active_q1_problems"] = active_counts[1]
+            metrics["global/v8_mix44444_active_q2_problems"] = active_counts[2]
+            metrics["global/v8_mix44444_active_q3_problems"] = active_counts[3]
 
         print(f"problem_solved_in_state_0: {self.problems_solved_in_state_0}")
         print(f"problem_solved_in_state_0_hard: {self.problems_solved_in_state_0_hard}")
@@ -1893,16 +2060,18 @@ class RayPPOTrainer:
             # Store original inputs (use prompts from generation output, same as training rollout)
             # This ensures the chat template is correctly applied
             if "prompts" in test_output_gen_batch.batch:
-                input_texts = self.tokenizer.batch_decode(test_output_gen_batch.batch["prompts"], skip_special_tokens=True)
+                input_texts = self.tokenizer.batch_decode(
+                    test_output_gen_batch.batch["prompts"], skip_special_tokens=False
+                )
             else:
                 # Fallback: decode from input_ids (may not have chat template applied correctly)
                 input_ids = test_batch.batch["input_ids"]
-                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=False) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=False) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
@@ -2592,6 +2761,8 @@ class RayPPOTrainer:
                         gen_batch.non_tensor_batch["v7_t"] = mixed_data.non_tensor_batch["v7_t"]
                     if "v7_prompt_mode" in mixed_data.non_tensor_batch:
                         gen_batch.non_tensor_batch["v7_prompt_mode"] = mixed_data.non_tensor_batch["v7_prompt_mode"]
+                    if "v8_mix_group" in mixed_data.non_tensor_batch:
+                        gen_batch.non_tensor_batch["v8_mix_group"] = mixed_data.non_tensor_batch["v8_mix_group"]
                     gen_batch_output = gen_batch
                 else:
                     # No mixing, repeat as usual
@@ -2781,6 +2952,8 @@ class RayPPOTrainer:
                             batch.non_tensor_batch["v7_t"] = mixed_data.non_tensor_batch["v7_t"]
                         if "v7_prompt_mode" in mixed_data.non_tensor_batch:
                             batch.non_tensor_batch["v7_prompt_mode"] = mixed_data.non_tensor_batch["v7_prompt_mode"]
+                        if "v8_mix_group" in mixed_data.non_tensor_batch:
+                            batch.non_tensor_batch["v8_mix_group"] = mixed_data.non_tensor_batch["v8_mix_group"]
                         if "subproblem_index" in mixed_data.non_tensor_batch:
                             batch.non_tensor_batch["subproblem_index"] = np.array(
                                 mixed_data.non_tensor_batch["subproblem_index"], dtype=np.int32
@@ -3355,10 +3528,19 @@ class RayPPOTrainer:
                                             if isinstance(subproblem_correct_count, np.ndarray)
                                             else (np.asarray(subproblem_correct_count, dtype=object) if subproblem_correct_count is not None else None)
                                         )
+                                        v8_mix_group_arr = batch.non_tensor_batch.get("v8_mix_group", None)
+                                        if v8_mix_group_arr is not None and not isinstance(v8_mix_group_arr, np.ndarray):
+                                            v8_mix_group_arr = np.asarray(v8_mix_group_arr, dtype=np.int32)
+                                        is_v8_mix44444_adaptive = bool(
+                                            self.ts_version == "v8"
+                                            and self.v8_mix44444_adaptive
+                                            and str(self.config.data.get("v7_t_mix_mode", "")).lower() == "mix44444"
+                                        )
 
                                         for _, grp_indices in uid_to_indices.items():
                                             grp_t4 = []
                                             grp_orig = []
+                                            grp_q = {1: [], 2: [], 3: [], 4: []}
                                             for gi in grp_indices:
                                                 is_mixed = bool(teacher_student_mixed_flags[gi])
                                                 t_val = None
@@ -3371,9 +3553,32 @@ class RayPPOTrainer:
                                                     grp_t4.append(int(gi))
                                                 elif not is_mixed:
                                                     grp_orig.append(int(gi))
+                                                    if v8_mix_group_arr is not None and gi < len(v8_mix_group_arr):
+                                                        try:
+                                                            gid = int(v8_mix_group_arr[gi])
+                                                            if gid in (1, 2, 3, 4):
+                                                                grp_q[gid].append(int(gi))
+                                                        except Exception:
+                                                            pass
 
-                                            # Apply separate only to mix44-like groups.
-                                            if len(grp_t4) == 4 and len(grp_orig) == 4 and part_correct_np is not None and part_token_mask is not None:
+                                            is_mix44_like = len(grp_t4) == 4 and len(grp_orig) == 4
+                                            is_mix44444_like = len(grp_t4) == 4 and all(len(grp_q[qid]) == 4 for qid in [1, 2, 3, 4])
+                                            total_q = sum(len(grp_q[qid]) for qid in [1, 2, 3, 4])
+                                            is_mix44444_adaptive_like = (
+                                                is_v8_mix44444_adaptive
+                                                and len(grp_t4) >= 4
+                                                and len(grp_q[4]) >= 4
+                                                and all(len(grp_q[qid]) in (0, 4) for qid in [1, 2, 3])
+                                                and total_q == len(grp_orig)
+                                                and (len(grp_t4) + total_q) == len(grp_indices)
+                                            )
+
+                                            # Apply separate to mix44 and mix44444 layouts.
+                                            if (
+                                                is_mix44_like
+                                                or is_mix44444_like
+                                                or is_mix44444_adaptive_like
+                                            ) and part_correct_np is not None and part_token_mask is not None:
                                                 parse_fail_indices = set()
                                                 if subproblem_k_arr is not None:
                                                     for si in grp_t4:
@@ -3418,18 +3623,53 @@ class RayPPOTrainer:
                                                     modified_advantages[sample_i, valid_mask] = local_min_adv
                                                     stage1_assigned += int(valid_mask.sum().item())
 
-                                                # Stage-2 on originals only (separate from t4).
-                                                if len(grp_orig) > 1 and token_level_scores is not None:
-                                                    orig_rewards = []
-                                                    for sample_i in grp_orig:
-                                                        reward_scalar = (token_level_scores[sample_i] * response_mask[sample_i].float()).sum().item()
-                                                        orig_rewards.append(float(reward_scalar))
-                                                    orig_reward_t = torch.tensor(orig_rewards, device=device, dtype=torch.float32)
-                                                    orig_adv_t = _dr_grpo_adv(orig_reward_t)
-                                                    for j, sample_i in enumerate(grp_orig):
-                                                        valid_mask = response_mask[sample_i]
-                                                        modified_advantages[sample_i, valid_mask] = orig_adv_t[j]
-                                                        stage2_assigned += int(valid_mask.sum().item())
+                                                # For mix44/mix44444-like paths: any t4 response token not covered
+                                                # by part masks is explicitly neutralized to 0 (avoid fallback to
+                                                # initial GRPO advantage on leaked tokens).
+                                                if is_mix44_like or is_mix44444_like or is_mix44444_adaptive_like:
+                                                    for sample_i in grp_t4:
+                                                        if sample_i in parse_fail_indices:
+                                                            continue
+                                                        part_union_mask = (
+                                                            (part_token_mask[sample_i, :4] > 0.5).any(dim=0)
+                                                            & response_mask[sample_i]
+                                                        )
+                                                        leak_mask = response_mask[sample_i] & (~part_union_mask)
+                                                        if leak_mask.any():
+                                                            modified_advantages[sample_i, leak_mask] = 0.0
+                                                            stage1_assigned += int(leak_mask.sum().item())
+
+                                                # Stage-2 on original-template branches (separate from t4).
+                                                if token_level_scores is not None:
+                                                    if is_mix44444_like or is_mix44444_adaptive_like:
+                                                        # Four independent GRPO groups: q1/q2/q3/q4, each with 4 samples.
+                                                        for qid in [1, 2, 3, 4]:
+                                                            grp_qi = grp_q[qid]
+                                                            if len(grp_qi) <= 1:
+                                                                continue
+                                                            q_rewards = []
+                                                            for sample_i in grp_qi:
+                                                                reward_scalar = (token_level_scores[sample_i] * response_mask[sample_i].float()).sum().item()
+                                                                q_rewards.append(float(reward_scalar))
+                                                            q_reward_t = torch.tensor(q_rewards, device=device, dtype=torch.float32)
+                                                            q_adv_t = _dr_grpo_adv(q_reward_t)
+                                                            for j, sample_i in enumerate(grp_qi):
+                                                                valid_mask = response_mask[sample_i]
+                                                                modified_advantages[sample_i, valid_mask] = q_adv_t[j]
+                                                                stage2_assigned += int(valid_mask.sum().item())
+                                                    else:
+                                                        # mix44 behavior: one GRPO group over original branch.
+                                                        if len(grp_orig) > 1:
+                                                            orig_rewards = []
+                                                            for sample_i in grp_orig:
+                                                                reward_scalar = (token_level_scores[sample_i] * response_mask[sample_i].float()).sum().item()
+                                                                orig_rewards.append(float(reward_scalar))
+                                                            orig_reward_t = torch.tensor(orig_rewards, device=device, dtype=torch.float32)
+                                                            orig_adv_t = _dr_grpo_adv(orig_reward_t)
+                                                            for j, sample_i in enumerate(grp_orig):
+                                                                valid_mask = response_mask[sample_i]
+                                                                modified_advantages[sample_i, valid_mask] = orig_adv_t[j]
+                                                                stage2_assigned += int(valid_mask.sum().item())
                                             else:
                                                 # Fallback to together-mode behavior when group is not mix44-like.
                                                 if len(grp_t4) > 0 and part_correct_np is not None and part_token_mask is not None:
@@ -3555,6 +3795,125 @@ class RayPPOTrainer:
                                             
                                             # Start with original advantages (non-mixed samples will keep original)
                                             modified_advantages = advantages.clone()
+                                            v7_adv_group_mode = str(self.config.data.get("v7_adv_group_mode", "together")).lower()
+                                            v7_t_mix_mode_cfg = str(self.config.data.get("v7_t_mix_mode", "legacy_sub8")).lower()
+                                            v7_reward_map_mode = str(self.config.data.get("v7_reward_map_mode", "legacy_k")).lower()
+                                            v7_separate_enabled = v7_adv_group_mode == "separate" and v7_t_mix_mode_cfg == "mix44"
+                                            v7_separate_groups_applied = 0
+
+                                            # v7 mix44 separate:
+                                            # For each problem group of 8 samples, split into:
+                                            # - 4 mixed t4 samples: subgroup GRPO on v7 reward mapping
+                                            # - 4 original samples: subgroup GRPO on reward_fn reward
+                                            if v7_separate_enabled:
+                                                response_mask_all = batch.batch.get("response_mask", None)
+                                                token_level_scores_all = batch.batch.get("token_level_scores", None)
+                                                problem_ids_arr = batch.non_tensor_batch.get("problem_id", None)
+                                                v7_t_arr = batch.non_tensor_batch.get("v7_t", None)
+                                                reward_models = batch.non_tensor_batch.get("reward_model", None)
+                                                subproblem_correct_count = batch.non_tensor_batch.get("subproblem_correct_count", None)
+                                                if (
+                                                    response_mask_all is not None
+                                                    and token_level_scores_all is not None
+                                                    and problem_ids_arr is not None
+                                                    and v7_t_arr is not None
+                                                    and subproblem_correct_count is not None
+                                                ):
+                                                    if isinstance(problem_ids_arr, np.ndarray):
+                                                        problem_ids_list = [str(x) for x in problem_ids_arr.tolist()]
+                                                    else:
+                                                        problem_ids_list = [str(x) for x in list(problem_ids_arr)]
+                                                    if isinstance(v7_t_arr, np.ndarray):
+                                                        v7_t_list = v7_t_arr.tolist()
+                                                    else:
+                                                        v7_t_list = list(v7_t_arr)
+
+                                                    mixed_indices_set = set(int(x) for x in mixed_indices.tolist())
+                                                    pid_to_indices = defaultdict(list)
+                                                    for i, pid in enumerate(problem_ids_list):
+                                                        pid_to_indices[pid].append(i)
+
+                                                    def _dr_grpo_adv_v7(sample_rewards: torch.Tensor) -> torch.Tensor:
+                                                        centered = sample_rewards - sample_rewards.mean()
+                                                        if norm_adv_by_std_in_grpo:
+                                                            std = centered.std(unbiased=False)
+                                                            if std.item() > 1e-6:
+                                                                centered = centered / (std + 1e-6)
+                                                        return centered
+
+                                                    def _k_to_reward_v7(sample_i: int, k_val: int) -> float:
+                                                        if k_val <= 0:
+                                                            return 0.0
+                                                        if v7_reward_map_mode == "absolute_difficulty":
+                                                            q_start = 1
+                                                            if reward_models is not None and sample_i < len(reward_models):
+                                                                rm = reward_models[sample_i]
+                                                                if not isinstance(rm, dict):
+                                                                    rm = rm.__dict__ if hasattr(rm, "__dict__") else {}
+                                                                try:
+                                                                    q_start = int(rm.get("v7_q_start", 1))
+                                                                except Exception:
+                                                                    q_start = 1
+                                                            abs_q_idx = max(1, min(4, q_start + int(k_val) - 1))
+                                                            if abs_q_idx == 1:
+                                                                return 0.1
+                                                            if abs_q_idx == 2:
+                                                                return 0.2
+                                                            if abs_q_idx == 3:
+                                                                return 0.5
+                                                            return 1.0
+                                                        if k_val == 1:
+                                                            return 0.1
+                                                        if k_val == 2:
+                                                            return 0.2
+                                                        if k_val == 3:
+                                                            return 0.5
+                                                        return 1.0
+
+                                                    for _pid, idxs in pid_to_indices.items():
+                                                        if len(idxs) != 8:
+                                                            continue
+                                                        grp_mixed = [i for i in idxs if i in mixed_indices_set]
+                                                        grp_orig = [i for i in idxs if i not in mixed_indices_set]
+                                                        if len(grp_mixed) != 4 or len(grp_orig) != 4:
+                                                            continue
+
+                                                        is_t4_group = True
+                                                        for i in grp_mixed:
+                                                            try:
+                                                                if int(v7_t_list[i]) != 4:
+                                                                    is_t4_group = False
+                                                                    break
+                                                            except Exception:
+                                                                is_t4_group = False
+                                                                break
+                                                        if not is_t4_group:
+                                                            continue
+
+                                                        mixed_rewards = []
+                                                        for i in grp_mixed:
+                                                            try:
+                                                                k_val = int(subproblem_correct_count[i])
+                                                            except Exception:
+                                                                k_val = 0
+                                                            mixed_rewards.append(_k_to_reward_v7(i, k_val))
+                                                        r_m = torch.tensor(mixed_rewards, device=advantages.device, dtype=torch.float32)
+                                                        a_m = _dr_grpo_adv_v7(r_m)
+                                                        for j, sample_i in enumerate(grp_mixed):
+                                                            valid_mask = response_mask_all[sample_i].bool()
+                                                            modified_advantages[sample_i, valid_mask] = a_m[j]
+
+                                                        orig_rewards = []
+                                                        for i in grp_orig:
+                                                            valid_mask = response_mask_all[i].bool()
+                                                            reward_scalar = (token_level_scores_all[i] * valid_mask.float()).sum().item()
+                                                            orig_rewards.append(float(reward_scalar))
+                                                        r_o = torch.tensor(orig_rewards, device=advantages.device, dtype=torch.float32)
+                                                        a_o = _dr_grpo_adv_v7(r_o)
+                                                        for j, sample_i in enumerate(grp_orig):
+                                                            valid_mask = response_mask_all[sample_i].bool()
+                                                            modified_advantages[sample_i, valid_mask] = a_o[j]
+                                                        v7_separate_groups_applied += 1
                                             
                                             # Convert mixed_indices to tensor for indexing
                                             mixed_indices_tensor = torch.tensor(mixed_indices, device=advantages.device, dtype=torch.long)
@@ -3564,7 +3923,7 @@ class RayPPOTrainer:
                                             correctness_mask_bool = token_correctness_mask.bool()  # (batch_size, response_length)
                                             
                                             # Get advantages for mixed samples only
-                                            mixed_advantages = advantages[mixed_indices_tensor]  # (num_mixed, response_length)
+                                            mixed_advantages = modified_advantages[mixed_indices_tensor]  # (num_mixed, response_length)
                                             mixed_correctness_mask = correctness_mask_bool[mixed_indices_tensor]  # (num_mixed, response_length)
                                             
                                             # For each mixed sample, get the advantage value (same for all tokens due to GRPO)
@@ -3934,6 +4293,11 @@ class RayPPOTrainer:
                                                       f"wrong_tokens set to -abs(correct) (avg={avg_wrong_adv:.4f}), "
                                                       f"correct_tokens={mixed_correct_count}, wrong_tokens={mixed_wrong_count}, total={mixed_total_count} "
                                                       f"(NOTE: includes padding tokens, response_mask not available)")
+                                            if v7_separate_enabled:
+                                                print(
+                                                    f"[v7_advantage] mode={v7_adv_group_mode}, mix_mode={v7_t_mix_mode_cfg}, "
+                                                    f"separate_groups_applied={v7_separate_groups_applied}"
+                                                )
                                         else:
                                             # No mixed samples, no modification needed
                                             pass
