@@ -148,6 +148,8 @@ class RLHFDataset(Dataset):
         self.teacher_lemmas = config.get("teacher_lemmas", None)
         self.subproblems_dict = config.get("subproblems_dict", None)
         self.subproblems_jsonl_path = config.get("subproblems_jsonl_path", None)
+        self.nurl_hints_jsonl_path = config.get("nurl_hints_jsonl_path", None)
+        self.nurl_hints_dict = config.get("nurl_hints_dict", None)
         # v7 format control: "subproblem" keeps original **Subproblem k** format,
         # "pn" uses generic Problem N + <pN></pN> output protocol.
         self.v7_format_mode = str(config.get("v7_format_mode", "subproblem")).lower()
@@ -171,6 +173,29 @@ class RLHFDataset(Dataset):
             except Exception as e:
                 logger.warning(f"Failed to load subproblems from {self.subproblems_jsonl_path}: {e}")
                 self.subproblems_dict = {}
+        if self.nurl_hints_jsonl_path is not None and self.nurl_hints_dict is None:
+            self.nurl_hints_dict = {}
+            try:
+                with open(self.nurl_hints_jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        data = json.loads(line)
+                        problem_id = str(data.get("problem_id", ""))
+                        if not problem_id:
+                            continue
+                        hint = (
+                            data.get("dpsk_hint")
+                            or data.get("gpt_hint")
+                            or data.get("hint")
+                            or data.get("abstract")
+                            or ""
+                        )
+                        self.nurl_hints_dict[problem_id] = str(hint)
+            except Exception as e:
+                logger.warning(f"Failed to load nurl hints from {self.nurl_hints_jsonl_path}: {e}")
+                self.nurl_hints_dict = {}
         self._download()
         self._read_files_and_tokenize()
 
@@ -508,6 +533,12 @@ class RLHFDataset(Dataset):
             self._process_ts_v4(row_dict, messages, raw_prompt)
         elif self.ts_version == 'v5' or self.ts_version == 'v7' or self.ts_version == 'v8':
             self._process_ts_v5(row_dict, messages, raw_prompt)
+        elif self.ts_version == 'questa':
+            # QuestA mode intentionally keeps prompts unchanged here.
+            # The question augmentation (hint prefix) is materialized in the dataset itself.
+            return
+        elif self.ts_version == 'nurl':
+            self._process_ts_nurl(row_dict, messages)
     
     def _process_ts_v1(self, row_dict: dict, raw_prompt: str):
         """Process ts_version v1: Add teacher hints to prompts."""
@@ -527,12 +558,12 @@ class RLHFDataset(Dataset):
         if problem_id_str not in self.teacher_hint_dict:
             row_dict['raw_prompt_hint'] = original_messages
             return
-        
+
         hint_str = self.teacher_hint_dict[problem_id_str]
         if hint_str == "":
             row_dict['raw_prompt_hint'] = original_messages
             return
-        
+
         try:
             hint_data = json.loads(hint_str)
             correct_prefix = hint_data.get("correct_prefix", "")
@@ -565,6 +596,23 @@ class RLHFDataset(Dataset):
         except Exception as e:
             logger.warning(f"Error processing ts_v1 for problem_id {problem_id}: {e}")
             row_dict['raw_prompt_hint'] = original_messages
+
+    def _process_ts_nurl(self, row_dict: dict, messages: list):
+        """Process ts_version nurl: attach offline abstract hint for stage2 dynamic injection."""
+        problem_id = row_dict.get("problem_id")
+        if problem_id is None:
+            return
+        problem_id_str = str(problem_id)
+        hint = ""
+        if isinstance(self.nurl_hints_dict, dict):
+            hint = str(self.nurl_hints_dict.get(problem_id_str, ""))
+        row_dict["nurl_hint"] = hint
+        user_prompt = ""
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                user_prompt = msg.get("content", "")
+                break
+        row_dict["nurl_question"] = user_prompt
     
     def _process_ts_v2(self, row_dict: dict, messages: list, raw_prompt: str):
         """Process ts_version v2: Add crafted wrong answers to prompts."""

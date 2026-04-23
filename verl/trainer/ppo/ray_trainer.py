@@ -712,7 +712,26 @@ class RayPPOTrainer:
         
         # Process different ts_version variants
         # Now we directly use raw_prompt_* fields from dataset instead of decoding input_ids
-        if "raw_prompt_hint" in batch.non_tensor_batch:
+        if self.ts_version == "nurl":
+            mixed_raw_prompts = []
+            mixed_reward_models = []
+            teacher_student_mixed_flags = []
+            nurl_hints = []
+            nurl_questions = []
+            reward_models = batch.non_tensor_batch.get("reward_model", None)
+            hints_arr = batch.non_tensor_batch.get("nurl_hint", None)
+            questions_arr = batch.non_tensor_batch.get("nurl_question", None)
+            for i in range(batch_size):
+                original_messages = original_raw_prompts[i]
+                original_reward_model = reward_models[i] if reward_models is not None else {}
+                hint = str(hints_arr[i]) if hints_arr is not None and i < len(hints_arr) else ""
+                question = str(questions_arr[i]) if questions_arr is not None and i < len(questions_arr) else ""
+                mixed_raw_prompts.extend([original_messages] * n)
+                mixed_reward_models.extend([original_reward_model.copy() for _ in range(n)])
+                teacher_student_mixed_flags.extend([False] * n)
+                nurl_hints.extend([hint] * n)
+                nurl_questions.extend([question] * n)
+        elif "raw_prompt_hint" in batch.non_tensor_batch:
             # v1/v2: Mix hint and no-hint prompts
             hint_n = n // 2
             no_hint_n = n - hint_n
@@ -897,6 +916,15 @@ class RayPPOTrainer:
                 v7_t_mix_mode = str(self.config.data.get("v7_t_mix_mode", "legacy_sub8")).lower()
                 v7_prompt_mode = str(self.config.data.get("v7_prompt_mode", "explicit_t")).lower()
                 v7_1_problem_match = str(self.config.data.get("v7_1_problem_match", "v7")).lower()
+                # v8 + mix44 curriculum level control:
+                # data.v7_curri_level=j means mix44 curriculum branch uses t=j (j in 1..4).
+                # Default j=4 preserves original behavior.
+                v7_curri_level_cfg = self.config.data.get("v7_curri_level", 4)
+                try:
+                    v7_curri_level = int(v7_curri_level_cfg)
+                except (TypeError, ValueError):
+                    v7_curri_level = 4
+                v7_curri_level = max(1, min(4, v7_curri_level))
 
                 mixed_raw_prompts = []
                 mixed_reward_models = []
@@ -963,7 +991,8 @@ class RayPPOTrainer:
                             adaptive_t = max(1, min(4, adaptive_t))
                             t_plan = [adaptive_t, adaptive_t, adaptive_t, adaptive_t, 0, 0, 0, 0]
                         else:
-                            t_plan = [4, 4, 4, 4, 0, 0, 0, 0]
+                            mix44_curr_t = v7_curri_level if self.ts_version == "v8" else 4
+                            t_plan = [mix44_curr_t, mix44_curr_t, mix44_curr_t, mix44_curr_t, 0, 0, 0, 0]
                     elif v7_t_mix_mode == "mix44":
                         # Generalize by ratio t_curriculum:orig = 1:1 (using t=0 for original).
                         base = n // 2
@@ -974,8 +1003,9 @@ class RayPPOTrainer:
                             t_plan = [adaptive_t] * base + [0] * base
                             t_plan.extend([adaptive_t, 0][:rem])
                         else:
-                            t_plan = [4] * base + [0] * base
-                            t_plan.extend([4, 0][:rem])
+                            mix44_curr_t = v7_curri_level if self.ts_version == "v8" else 4
+                            t_plan = [mix44_curr_t] * base + [0] * base
+                            t_plan.extend([mix44_curr_t, 0][:rem])
                     elif v7_t_mix_mode == "balanced_11114" and n == 8:
                         # One sample for t=4/3/2/1 plus four GRPO-style original samples.
                         # Use t=0 as an internal sentinel for original samples.
@@ -1056,6 +1086,11 @@ class RayPPOTrainer:
                             and v7_1_problem_match == "grpo"
                             and v7_t_mix_mode != "balanced_11114"
                             and not (self.ts_version == "v8" and self.v8_use_adaptive)
+                            and not (
+                                self.ts_version == "v8"
+                                and v7_t_mix_mode == "mix44"
+                                and v7_curri_level == 1
+                            )
                         ):
                             # Match GRPO distribution for the 1-problem branch.
                             current_messages = original_messages
@@ -1148,6 +1183,11 @@ class RayPPOTrainer:
                     non_tensor_batch_dict["v7_prompt_mode"] = np.array(v7_prompt_mode_values, dtype=object)
                 if 'v8_mix_group_values' in locals() and len(v8_mix_group_values) > 0:
                     non_tensor_batch_dict["v8_mix_group"] = np.array(v8_mix_group_values, dtype=np.int32)
+            if self.ts_version == "nurl":
+                if "nurl_hints" in locals() and len(nurl_hints) > 0:
+                    non_tensor_batch_dict["nurl_hint"] = np.array(nurl_hints, dtype=object)
+                if "nurl_questions" in locals() and len(nurl_questions) > 0:
+                    non_tensor_batch_dict["nurl_question"] = np.array(nurl_questions, dtype=object)
             
             # Add problem_id: expand original problem_id to match mixed_raw_prompts order
             if "problem_id" in batch.non_tensor_batch:
@@ -1170,6 +1210,57 @@ class RayPPOTrainer:
             return mixed_data
         
         return None
+
+    def _apply_nurl_hint_to_repeated_prompts(
+        self, repeated_gen_batch: DataProto, hard_mask: torch.Tensor, rollout_n: int
+    ) -> int:
+        """Inject NuRL offline hint for hard groups into first (rollout_n-1) rollouts in-place.
+
+        Returns the number of modified rollouts.
+        """
+        if "raw_prompt" not in repeated_gen_batch.non_tensor_batch:
+            return 0
+        hints = repeated_gen_batch.non_tensor_batch.get("nurl_hint", None)
+        if hints is None:
+            return 0
+        raw_prompts = repeated_gen_batch.non_tensor_batch["raw_prompt"]
+        modified = 0
+        hard_list = hard_mask.detach().cpu().tolist()
+        group_size = int(max(1, rollout_n))
+        for sample_idx, is_hard in enumerate(hard_list):
+            if not bool(is_hard):
+                continue
+            base_idx = sample_idx * group_size
+            if base_idx >= len(hints):
+                continue
+            hint = str(hints[base_idx]) if hints[base_idx] is not None else ""
+            if not hint.strip():
+                continue
+            append_text = f"\n\nYou might find the following hint helpful:\n{hint}"
+            for ridx in range(max(0, group_size - 1)):
+                idx = base_idx + ridx
+                if idx >= len(raw_prompts):
+                    break
+                msgs = raw_prompts[idx]
+                if not isinstance(msgs, list):
+                    continue
+                new_msgs = deepcopy(msgs)
+                user_pos = None
+                for j in range(len(new_msgs) - 1, -1, -1):
+                    m = new_msgs[j]
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        user_pos = j
+                        break
+                if user_pos is None:
+                    continue
+                user_content = str(new_msgs[user_pos].get("content", ""))
+                if append_text in user_content:
+                    continue
+                new_msgs[user_pos] = {**new_msgs[user_pos], "content": user_content + append_text}
+                raw_prompts[idx] = new_msgs
+                modified += 1
+        repeated_gen_batch.non_tensor_batch["raw_prompt"] = raw_prompts
+        return modified
 
     def _init_teacher_model(self):
         """Initialize teacher model hint generator."""
@@ -2763,6 +2854,10 @@ class RayPPOTrainer:
                         gen_batch.non_tensor_batch["v7_prompt_mode"] = mixed_data.non_tensor_batch["v7_prompt_mode"]
                     if "v8_mix_group" in mixed_data.non_tensor_batch:
                         gen_batch.non_tensor_batch["v8_mix_group"] = mixed_data.non_tensor_batch["v8_mix_group"]
+                    if "nurl_hint" in mixed_data.non_tensor_batch:
+                        gen_batch.non_tensor_batch["nurl_hint"] = mixed_data.non_tensor_batch["nurl_hint"]
+                    if "nurl_question" in mixed_data.non_tensor_batch:
+                        gen_batch.non_tensor_batch["nurl_question"] = mixed_data.non_tensor_batch["nurl_question"]
                     gen_batch_output = gen_batch
                 else:
                     # No mixing, repeat as usual
@@ -2771,6 +2866,7 @@ class RayPPOTrainer:
                     )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                nurl_reward_batch_before = None
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
@@ -2899,6 +2995,41 @@ class RayPPOTrainer:
                                           f"Total wrong tokens={mixed_wrong_tokens.sum().item()}")
                                 print(f"[v7_debug] All samples: Total correct tokens={correct_tokens_per_sample.sum().item()}, "
                                       f"Total wrong tokens={wrong_tokens_per_sample.sum().item()}")
+
+                    # NuRL stage2: detect all-fail groups on initial rollout,
+                    # inject offline abstract hint into first (n-1) rollouts, and regenerate in-place.
+                    if curri_method == "teacher_student" and ts_version == "nurl" and mixed_data is not None:
+                        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+                        if rollout_n > 1:
+                            with marked_timer("nurl_reward_before_hint", timing_raw, color="yellow"):
+                                batch_before_hint = batch.repeat(repeat_times=rollout_n, interleave=True)
+                                batch_before_hint.batch.pop("input_ids", None)
+                                batch_before_hint.batch.pop("attention_mask", None)
+                                batch_before_hint.batch.pop("position_ids", None)
+                                batch_before_hint = batch_before_hint.union(gen_batch_output)
+                                if "reward_model" in mixed_data.non_tensor_batch:
+                                    batch_before_hint.non_tensor_batch["reward_model"] = mixed_data.non_tensor_batch["reward_model"]
+                                reward_tensor_before, _ = compute_reward(batch_before_hint, self.reward_fn)
+                                nurl_reward_batch_before = reward_tensor_before.sum(-1).reshape(-1, rollout_n).mean(1)
+                            hard_mask = nurl_reward_batch_before == 0
+                            solve_none_before = int(hard_mask.sum().item())
+                            solve_all_before = int((nurl_reward_batch_before == 1).sum().item())
+                            metrics["batch/solve_none_before_hint_injection"] = solve_none_before
+                            metrics["batch/solve_all_before_hint_injection"] = solve_all_before
+                            if solve_none_before > 0:
+                                retry_gen_batch = deepcopy(gen_batch_output)
+                                modified_rollouts = self._apply_nurl_hint_to_repeated_prompts(
+                                    retry_gen_batch, hard_mask=hard_mask, rollout_n=rollout_n
+                                )
+                                metrics["batch/nurl_hint_injected_rollouts"] = int(modified_rollouts)
+                                if modified_rollouts > 0:
+                                    with marked_timer("nurl_regen", timing_raw, color="red"):
+                                        if not self.async_rollout_mode:
+                                            gen_batch_output = self.actor_rollout_wg.generate_sequences(retry_gen_batch)
+                                        else:
+                                            gen_batch_output = self.async_rollout_manager.generate_sequences(retry_gen_batch)
+                                        timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
+                                        gen_batch_output.meta_info.pop("timing", None)
                     
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -2954,6 +3085,10 @@ class RayPPOTrainer:
                             batch.non_tensor_batch["v7_prompt_mode"] = mixed_data.non_tensor_batch["v7_prompt_mode"]
                         if "v8_mix_group" in mixed_data.non_tensor_batch:
                             batch.non_tensor_batch["v8_mix_group"] = mixed_data.non_tensor_batch["v8_mix_group"]
+                        if "nurl_hint" in mixed_data.non_tensor_batch:
+                            batch.non_tensor_batch["nurl_hint"] = mixed_data.non_tensor_batch["nurl_hint"]
+                        if "nurl_question" in mixed_data.non_tensor_batch:
+                            batch.non_tensor_batch["nurl_question"] = mixed_data.non_tensor_batch["nurl_question"]
                         if "subproblem_index" in mixed_data.non_tensor_batch:
                             batch.non_tensor_batch["subproblem_index"] = np.array(
                                 mixed_data.non_tensor_batch["subproblem_index"], dtype=np.int32
@@ -3039,6 +3174,16 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                         batch.batch["token_level_scores"] = reward_tensor
+                        if curri_method == "teacher_student" and ts_version == "nurl":
+                            rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+                            if rollout_n > 0 and reward_tensor.size(0) % rollout_n == 0:
+                                nurl_reward_batch_after = reward_tensor.sum(-1).reshape(-1, rollout_n).mean(1)
+                                metrics["batch/solve_none_after_hint_injection"] = int(
+                                    (nurl_reward_batch_after == 0).sum().item()
+                                )
+                                metrics["batch/solve_all_after_hint_injection"] = int(
+                                    (nurl_reward_batch_after == 1).sum().item()
+                                )
                         
                         # For v5: Set reward=1.0 for successfully truncated samples
                         # This must be done after reward computation but before _update_old_rewards and _save_rollout_samples
@@ -3417,6 +3562,16 @@ class RayPPOTrainer:
                                     modified_advantages = advantages.clone()
                                     device = advantages.device
                                     v8_adv_group_mode = str(self.config.data.get("v8_adv_group_mode", "together")).lower()
+                                    v7_t_mix_mode_cfg = str(self.config.data.get("v7_t_mix_mode", "")).lower()
+                                    v7_curri_level_cfg = self.config.data.get("v7_curri_level", 4)
+                                    try:
+                                        v7_curri_level = int(v7_curri_level_cfg)
+                                    except (TypeError, ValueError):
+                                        v7_curri_level = 4
+                                    v7_curri_level = max(1, min(4, v7_curri_level))
+                                    mix44_curriculum_t = (
+                                        v7_curri_level if (v7_t_mix_mode_cfg == "mix44" and not self.v8_use_adaptive) else 4
+                                    )
                                     use_k_as_subproblem_reward_cfg = self.config.data.get("use_k_as_subproblem_reward", False)
                                     if isinstance(use_k_as_subproblem_reward_cfg, str):
                                         use_k_as_subproblem_reward = use_k_as_subproblem_reward_cfg.strip().lower() in (
@@ -3473,13 +3628,14 @@ class RayPPOTrainer:
                                         return 1.0
 
                                     def _get_local_part_reward(part_correct_np_local: np.ndarray, sample_i: int, p_idx: int):
-                                        # Return binary reward for local part p_idx in {0,1}, or None if unavailable.
+                                        # Return binary reward for local part p_idx in {0,1}.
+                                        # For unavailable parts (e.g. v8 mix44 with v7_curri_level < 4), return 0.
                                         try:
                                             corr_val = int(part_correct_np_local[sample_i, p_idx])
                                         except Exception:
-                                            return None
+                                            return 0
                                         if corr_val not in (0, 1):
-                                            return None
+                                            return 0
                                         if not use_k_as_subproblem_reward:
                                             return corr_val
                                         # k-aware local rule: only contiguous prefix-correct parts are rewarded as 1.
@@ -3497,7 +3653,7 @@ class RayPPOTrainer:
                                     for i in mixed_indices:
                                         if v7_t_list is not None and i < len(v7_t_list):
                                             try:
-                                                if int(v7_t_list[i]) == 4:
+                                                if int(v7_t_list[i]) == mix44_curriculum_t:
                                                     t4_indices.append(int(i))
                                             except Exception:
                                                 pass
@@ -3549,7 +3705,7 @@ class RayPPOTrainer:
                                                         t_val = int(v7_t_list[gi])
                                                     except Exception:
                                                         t_val = None
-                                                if is_mixed and t_val == 4:
+                                                if is_mixed and t_val == mix44_curriculum_t:
                                                     grp_t4.append(int(gi))
                                                 elif not is_mixed:
                                                     grp_orig.append(int(gi))
