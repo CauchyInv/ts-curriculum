@@ -1225,6 +1225,7 @@ class RayPPOTrainer:
             return 0
         raw_prompts = repeated_gen_batch.non_tensor_batch["raw_prompt"]
         modified = 0
+        modified_indices = []
         hard_list = hard_mask.detach().cpu().tolist()
         group_size = int(max(1, rollout_n))
         for sample_idx, is_hard in enumerate(hard_list):
@@ -1242,6 +1243,10 @@ class RayPPOTrainer:
                 if idx >= len(raw_prompts):
                     break
                 msgs = raw_prompts[idx]
+                if isinstance(msgs, np.ndarray):
+                    msgs = msgs.tolist()
+                if isinstance(msgs, tuple):
+                    msgs = list(msgs)
                 if not isinstance(msgs, list):
                     continue
                 new_msgs = deepcopy(msgs)
@@ -1259,8 +1264,105 @@ class RayPPOTrainer:
                 new_msgs[user_pos] = {**new_msgs[user_pos], "content": user_content + append_text}
                 raw_prompts[idx] = new_msgs
                 modified += 1
+                modified_indices.append(idx)
         repeated_gen_batch.non_tensor_batch["raw_prompt"] = raw_prompts
+        if modified_indices:
+            self._retokenize_modified_nurl_prompts(repeated_gen_batch, modified_indices)
         return modified
+
+    def _retokenize_modified_nurl_prompts(self, repeated_gen_batch: DataProto, modified_indices: list[int]) -> None:
+        """Re-tokenize modified NuRL prompts in-place so second rollout uses injected hints.
+
+        This runs only in ts_version=nurl path and updates prompt-side tensors:
+        prompts/input_ids/attention_mask/position_ids (+ raw_prompt_ids if present).
+        """
+        if "raw_prompt" not in repeated_gen_batch.non_tensor_batch:
+            return
+        if repeated_gen_batch.batch is None:
+            return
+        if len(modified_indices) == 0:
+            return
+
+        # Keep indices deterministic and unique for stable debugging.
+        modified_indices = sorted(set(int(i) for i in modified_indices if i is not None))
+
+        max_prompt_length = int(self.config.data.max_prompt_length)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        raw_prompts = repeated_gen_batch.non_tensor_batch["raw_prompt"]
+
+        for idx in modified_indices:
+            if idx < 0 or idx >= len(raw_prompts):
+                continue
+
+            msgs = raw_prompts[idx]
+            if isinstance(msgs, np.ndarray):
+                msgs = msgs.tolist()
+            if isinstance(msgs, tuple):
+                msgs = list(msgs)
+            if not isinstance(msgs, list):
+                continue
+
+            try:
+                prompt_ids = self.tokenizer.apply_chat_template(
+                    msgs,
+                    tokenize=True,
+                    return_tensors="pt",
+                    add_generation_prompt=True,
+                ).squeeze(0).to(torch.long)
+            except Exception:
+                continue
+
+            # Keep the tail to preserve generation prompt and injected hint if overlong.
+            if prompt_ids.numel() > max_prompt_length:
+                prompt_ids = prompt_ids[-max_prompt_length:]
+
+            seq_len = int(prompt_ids.numel())
+            pad_len = max(0, max_prompt_length - seq_len)
+
+            if pad_len > 0:
+                pad = torch.full((pad_len,), int(pad_id), dtype=torch.long)
+                padded_prompt_ids = torch.cat([pad, prompt_ids], dim=0)
+            else:
+                padded_prompt_ids = prompt_ids
+
+            new_attention_mask = torch.zeros(max_prompt_length, dtype=torch.long)
+            if seq_len > 0:
+                new_attention_mask[-seq_len:] = 1
+
+            # Position ids follow left-padding convention used by RL pipeline.
+            new_position_ids = torch.zeros(max_prompt_length, dtype=torch.long)
+            if seq_len > 0:
+                new_position_ids[-seq_len:] = torch.arange(seq_len, dtype=torch.long)
+
+            # Update tensor batch fields used by rollout engines.
+            if "prompts" in repeated_gen_batch.batch:
+                dst = repeated_gen_batch.batch["prompts"]
+                repeated_gen_batch.batch["prompts"][idx] = padded_prompt_ids.to(device=dst.device, dtype=dst.dtype)
+            if "input_ids" in repeated_gen_batch.batch:
+                dst = repeated_gen_batch.batch["input_ids"]
+                repeated_gen_batch.batch["input_ids"][idx] = padded_prompt_ids.to(device=dst.device, dtype=dst.dtype)
+            if "attention_mask" in repeated_gen_batch.batch:
+                dst = repeated_gen_batch.batch["attention_mask"]
+                repeated_gen_batch.batch["attention_mask"][idx] = new_attention_mask.to(device=dst.device, dtype=dst.dtype)
+            if "position_ids" in repeated_gen_batch.batch:
+                dst = repeated_gen_batch.batch["position_ids"]
+                # Some models may carry 2D/3D position ids; only update compatible 1D per sample.
+                if dst[idx].dim() == 1:
+                    repeated_gen_batch.batch["position_ids"][idx] = new_position_ids.to(device=dst.device, dtype=dst.dtype)
+
+            # Keep non-tensor raw prompt ids for downstream debug/inspection if present.
+            if "raw_prompt_ids" in repeated_gen_batch.non_tensor_batch:
+                try:
+                    arr = repeated_gen_batch.non_tensor_batch["raw_prompt_ids"]
+                    if isinstance(arr, np.ndarray):
+                        arr = arr.tolist()
+                    arr[idx] = prompt_ids.tolist()
+                    repeated_gen_batch.non_tensor_batch["raw_prompt_ids"] = np.array(arr, dtype=object)
+                except Exception:
+                    pass
 
     def _init_teacher_model(self):
         """Initialize teacher model hint generator."""
