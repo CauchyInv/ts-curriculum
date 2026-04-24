@@ -1319,39 +1319,51 @@ class RayPPOTrainer:
             if prompt_ids.numel() > max_prompt_length:
                 prompt_ids = prompt_ids[-max_prompt_length:]
 
-            seq_len = int(prompt_ids.numel())
-            pad_len = max(0, max_prompt_length - seq_len)
+            def _build_left_padded(width: int):
+                width = int(max(1, width))
+                ids = prompt_ids
+                if ids.numel() > width:
+                    ids = ids[-width:]
+                seq_len_local = int(ids.numel())
+                pad_len_local = max(0, width - seq_len_local)
+                if pad_len_local > 0:
+                    pad_local = torch.full((pad_len_local,), int(pad_id), dtype=torch.long)
+                    padded_ids_local = torch.cat([pad_local, ids], dim=0)
+                else:
+                    padded_ids_local = ids
+                attn_local = torch.zeros(width, dtype=torch.long)
+                pos_local = torch.zeros(width, dtype=torch.long)
+                if seq_len_local > 0:
+                    attn_local[-seq_len_local:] = 1
+                    pos_local[-seq_len_local:] = torch.arange(seq_len_local, dtype=torch.long)
+                return padded_ids_local, attn_local, pos_local, seq_len_local
 
-            if pad_len > 0:
-                pad = torch.full((pad_len,), int(pad_id), dtype=torch.long)
-                padded_prompt_ids = torch.cat([pad, prompt_ids], dim=0)
-            else:
-                padded_prompt_ids = prompt_ids
-
-            new_attention_mask = torch.zeros(max_prompt_length, dtype=torch.long)
-            if seq_len > 0:
-                new_attention_mask[-seq_len:] = 1
-
-            # Position ids follow left-padding convention used by RL pipeline.
-            new_position_ids = torch.zeros(max_prompt_length, dtype=torch.long)
-            if seq_len > 0:
-                new_position_ids[-seq_len:] = torch.arange(seq_len, dtype=torch.long)
+            # Base prompt-width tensors (legacy behavior).
+            padded_prompt_ids, new_attention_mask, new_position_ids, seq_len = _build_left_padded(max_prompt_length)
 
             # Update tensor batch fields used by rollout engines.
             if "prompts" in repeated_gen_batch.batch:
                 dst = repeated_gen_batch.batch["prompts"]
-                repeated_gen_batch.batch["prompts"][idx] = padded_prompt_ids.to(device=dst.device, dtype=dst.dtype)
+                width = int(dst.shape[-1]) if dst.dim() >= 2 else max_prompt_length
+                ids_w, _, _, _ = _build_left_padded(width)
+                repeated_gen_batch.batch["prompts"][idx] = ids_w.to(device=dst.device, dtype=dst.dtype)
             if "input_ids" in repeated_gen_batch.batch:
                 dst = repeated_gen_batch.batch["input_ids"]
-                repeated_gen_batch.batch["input_ids"][idx] = padded_prompt_ids.to(device=dst.device, dtype=dst.dtype)
+                width = int(dst.shape[-1]) if dst.dim() >= 2 else max_prompt_length
+                ids_w, _, _, _ = _build_left_padded(width)
+                repeated_gen_batch.batch["input_ids"][idx] = ids_w.to(device=dst.device, dtype=dst.dtype)
             if "attention_mask" in repeated_gen_batch.batch:
                 dst = repeated_gen_batch.batch["attention_mask"]
-                repeated_gen_batch.batch["attention_mask"][idx] = new_attention_mask.to(device=dst.device, dtype=dst.dtype)
+                width = int(dst.shape[-1]) if dst.dim() >= 2 else max_prompt_length
+                _, attn_w, _, _ = _build_left_padded(width)
+                repeated_gen_batch.batch["attention_mask"][idx] = attn_w.to(device=dst.device, dtype=dst.dtype)
             if "position_ids" in repeated_gen_batch.batch:
                 dst = repeated_gen_batch.batch["position_ids"]
                 # Some models may carry 2D/3D position ids; only update compatible 1D per sample.
                 if dst[idx].dim() == 1:
-                    repeated_gen_batch.batch["position_ids"][idx] = new_position_ids.to(device=dst.device, dtype=dst.dtype)
+                    width = int(dst.shape[-1]) if dst.dim() >= 2 else max_prompt_length
+                    _, _, pos_w, _ = _build_left_padded(width)
+                    repeated_gen_batch.batch["position_ids"][idx] = pos_w.to(device=dst.device, dtype=dst.dtype)
 
             # Keep non-tensor raw prompt ids for downstream debug/inspection if present.
             if "raw_prompt_ids" in repeated_gen_batch.non_tensor_batch:
@@ -3120,6 +3132,34 @@ class RayPPOTrainer:
                             metrics["batch/solve_all_before_hint_injection"] = solve_all_before
                             if solve_none_before > 0:
                                 retry_gen_batch = deepcopy(gen_batch_output)
+                                # NuRL async rollout path may drop non-tensor fields.
+                                # Backfill required metadata so hint injection + reward scoring are deterministic.
+                                expected_len = len(retry_gen_batch.non_tensor_batch.get("raw_prompt", []))
+                                if expected_len > 0:
+                                    def _backfill_key(key: str):
+                                        if key in retry_gen_batch.non_tensor_batch and len(retry_gen_batch.non_tensor_batch[key]) == expected_len:
+                                            return
+                                        src_arr = None
+                                        for src in (gen_batch.non_tensor_batch, mixed_data.non_tensor_batch):
+                                            if key in src and len(src[key]) == expected_len:
+                                                src_arr = src[key]
+                                                break
+                                        if src_arr is None:
+                                            for src in (gen_batch.non_tensor_batch, mixed_data.non_tensor_batch):
+                                                if key in src:
+                                                    base_arr = src[key]
+                                                    if len(base_arr) * rollout_n == expected_len:
+                                                        expanded = []
+                                                        for v in base_arr:
+                                                            expanded.extend([v] * rollout_n)
+                                                        src_arr = np.array(expanded, dtype=object)
+                                                        break
+                                        if src_arr is not None:
+                                            retry_gen_batch.non_tensor_batch[key] = np.array(src_arr, dtype=object)
+
+                                    for key in ("nurl_hint", "nurl_question", "data_source", "ability", "reward_model", "extra_info", "problem_id"):
+                                        _backfill_key(key)
+
                                 modified_rollouts = self._apply_nurl_hint_to_repeated_prompts(
                                     retry_gen_batch, hard_mask=hard_mask, rollout_n=rollout_n
                                 )
@@ -3130,6 +3170,16 @@ class RayPPOTrainer:
                                             gen_batch_output = self.actor_rollout_wg.generate_sequences(retry_gen_batch)
                                         else:
                                             gen_batch_output = self.async_rollout_manager.generate_sequences(retry_gen_batch)
+                                        # Keep rerolled batch metadata complete for downstream reward manager / save_rollout.
+                                        regen_len = len(gen_batch_output.non_tensor_batch.get("raw_prompt", []))
+                                        if regen_len > 0:
+                                            for key in ("nurl_hint", "nurl_question", "data_source", "ability", "reward_model", "extra_info", "problem_id"):
+                                                if key in gen_batch_output.non_tensor_batch and len(gen_batch_output.non_tensor_batch[key]) == regen_len:
+                                                    continue
+                                                if key in retry_gen_batch.non_tensor_batch and len(retry_gen_batch.non_tensor_batch[key]) == regen_len:
+                                                    gen_batch_output.non_tensor_batch[key] = np.array(
+                                                        retry_gen_batch.non_tensor_batch[key], dtype=object
+                                                    )
                                         timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                                         gen_batch_output.meta_info.pop("timing", None)
                     
