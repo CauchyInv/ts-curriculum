@@ -2908,6 +2908,10 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+        # DAPO-style filter_groups accumulation state (only used when algorithm.filter_groups.enable=true)
+        fg_accum_batch = None
+        fg_prompt_count = 0
+        fg_num_gen_batches = 0
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -3667,6 +3671,83 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # DAPO-style filter_groups in main_ppo path.
+                        # This branch is strictly opt-in and should not affect default behavior when disabled.
+                        filter_groups_cfg = getattr(self.config.algorithm, "filter_groups", None)
+                        fg_enabled = bool(filter_groups_cfg is not None and getattr(filter_groups_cfg, "enable", False))
+                        if fg_enabled:
+                            metric_name = getattr(filter_groups_cfg, "metric", None) or "acc"
+
+                            # Build per-trajectory metric used for grouping.
+                            if metric_name == "seq_final_reward":
+                                batch.non_tensor_batch["seq_final_reward"] = (
+                                    batch.batch["token_level_rewards"].sum(dim=-1).detach().cpu().numpy()
+                                )
+                            elif metric_name == "seq_reward":
+                                batch.non_tensor_batch["seq_reward"] = (
+                                    batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
+                                )
+
+                            if metric_name not in batch.non_tensor_batch:
+                                raise ValueError(
+                                    f"algorithm.filter_groups.metric={metric_name} not found in batch.non_tensor_batch keys: "
+                                    f"{list(batch.non_tensor_batch.keys())}"
+                                )
+
+                            # Group by prompt uid and keep groups with non-zero std (or singleton).
+                            prompt_uid2metric_vals = defaultdict(list)
+                            for uid, metric_val in zip(
+                                batch.non_tensor_batch["uid"], batch.non_tensor_batch[metric_name], strict=True
+                            ):
+                                prompt_uid2metric_vals[uid].append(metric_val)
+
+                            kept_prompt_uids = [
+                                uid
+                                for uid, vals in prompt_uid2metric_vals.items()
+                                if (np.std(vals) > 0) or (len(vals) == 1)
+                            ]
+
+                            kept_traj_idxs = []
+                            for idx, traj_uid in enumerate(batch.non_tensor_batch["uid"]):
+                                if traj_uid in kept_prompt_uids:
+                                    kept_traj_idxs.append(idx)
+                            filtered_batch = batch[kept_traj_idxs]
+
+                            # Accumulate filtered trajectories across generation batches in the same update step.
+                            fg_prompt_count += len(kept_prompt_uids)
+                            fg_num_gen_batches += 1
+                            fg_accum_batch = (
+                                filtered_batch
+                                if fg_accum_batch is None
+                                else DataProto.concat([fg_accum_batch, filtered_batch])
+                            )
+
+                            prompt_bsz = int(self.config.data.train_batch_size)
+                            rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+                            max_num_gen_batches = int(getattr(filter_groups_cfg, "max_num_gen_batches", 0))
+
+                            metrics["batch/filter_groups/kept_prompt_count_current"] = len(kept_prompt_uids)
+                            metrics["batch/filter_groups/accum_prompt_count"] = fg_prompt_count
+                            metrics["batch/filter_groups/num_gen_batches_in_step"] = fg_num_gen_batches
+
+                            if fg_prompt_count < prompt_bsz:
+                                # Not enough valid prompts yet: continue to next generated batch.
+                                if max_num_gen_batches <= 0 or fg_num_gen_batches < max_num_gen_batches:
+                                    continue
+                                raise ValueError(
+                                    f"filter_groups could not collect enough prompts: accum={fg_prompt_count} < "
+                                    f"train_batch_size={prompt_bsz}, while num_gen_batches={fg_num_gen_batches} >= "
+                                    f"max_num_gen_batches={max_num_gen_batches}. "
+                                    f"Try easier data/metric or set max_num_gen_batches<=0 for unlimited retries."
+                                )
+
+                            # Enough prompts collected for one update: align to exact train batch size.
+                            traj_bsz = prompt_bsz * rollout_n
+                            batch = fg_accum_batch[:traj_bsz]
+                            fg_accum_batch = None
+                            fg_prompt_count = 0
+                            fg_num_gen_batches = 0
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
