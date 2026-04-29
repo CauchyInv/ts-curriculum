@@ -2934,11 +2934,23 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                # Add old_rewards to batch if teacher_student is enabled
+                # Always materialize old_rewards for teacher_student batches so
+                # filter_groups accumulation can concat batches with identical keys.
+                #
+                # Exception: for ts_version=v9 with filter_groups enabled, old_rewards
+                # is currently not consumed by prompt-mixing logic, and injecting it
+                # only introduces an extra tensor key into DAPO-style accumulation.
+                # In that path, keep the batch schema minimal and skip old_rewards.
                 curri_method = self.config.data.get("curri_method", None)
-                if curri_method == "teacher_student" and self.old_rewards is not None:
-                    # Map old_rewards to batch items based on problem_id
-                    if "problem_id" in batch.non_tensor_batch:
+                filter_groups_cfg = getattr(self.config.algorithm, "filter_groups", None)
+                fg_enabled = bool(filter_groups_cfg is not None and getattr(filter_groups_cfg, "enable", False))
+                ts_version = self.config.data.get("ts_version", None)
+                skip_old_rewards_for_v9_fg = curri_method == "teacher_student" and ts_version == "v9" and fg_enabled
+
+                if curri_method == "teacher_student" and not skip_old_rewards_for_v9_fg:
+                    batch_size = len(batch.batch)
+                    batch_old_rewards = [0.0] * batch_size
+                    if "problem_id" in batch.non_tensor_batch and self.old_rewards is not None:
                         problem_ids = batch.non_tensor_batch["problem_id"]
                         batch_old_rewards = []
                         for pid in problem_ids:
@@ -2947,7 +2959,11 @@ class RayPPOTrainer:
                                 batch_old_rewards.append(self.old_rewards[pid_int].item())
                             else:
                                 batch_old_rewards.append(0.0)
-                        batch.batch["old_rewards"] = torch.tensor(batch_old_rewards, device=batch.batch["input_ids"].device, dtype=torch.float32)
+                    batch.batch["old_rewards"] = torch.tensor(
+                        batch_old_rewards,
+                        device=batch.batch["input_ids"].device,
+                        dtype=torch.float32,
+                    )
                 
                 # Process teacher-student prompts if enabled (before _get_gen_batch)
                 mixed_data = self._process_teacher_student_prompts(batch)
