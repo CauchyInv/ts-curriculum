@@ -3910,7 +3910,7 @@ class RayPPOTrainer:
                                     stage1_assigned = 0
                                     stage2_assigned = 0
 
-                                    if v8_adv_group_mode == "separate":
+                                    if v8_adv_group_mode in ("separate", "both_grpo"):
                                         # v8 separate:
                                         # - t4 samples: per-part local Dr.GRPO in each uid-group.
                                         # - original samples: Dr.GRPO only among originals in each uid-group.
@@ -3978,7 +3978,7 @@ class RayPPOTrainer:
                                                 and (len(grp_t4) + total_q) == len(grp_indices)
                                             )
 
-                                            # Apply separate to mix44 and mix44444 layouts.
+                                            # Apply separate-style grouping to mix44 and mix44444 layouts.
                                             if (
                                                 is_mix44_like
                                                 or is_mix44444_like
@@ -3993,56 +3993,76 @@ class RayPPOTrainer:
                                                         except Exception:
                                                             pass
 
-                                                # Stage-1 on t4: per-part reward in {0,1}, parse-fail treated as [0,0,0,0].
-                                                per_part_adv = {}
-                                                for p_idx in range(4):
-                                                    rewards_local = []
+                                                if v8_adv_group_mode == "both_grpo" and is_mix44_like:
+                                                    # v8 both_grpo (mix44 only):
+                                                    # - t4 branch does NOT use subproblem-level assignment.
+                                                    # - For each t4 sample, use only local part-4 reward (original question),
+                                                    #   then run GRPO within 4 t4 samples and assign one scalar advantage
+                                                    #   to all valid response tokens (standard GRPO token assignment).
+                                                    t4_rewards = []
                                                     for sample_i in grp_t4:
                                                         if sample_i in parse_fail_indices:
-                                                            rewards_local.append(0.0)
+                                                            t4_rewards.append(0.0)
                                                             continue
-                                                        corr_val = _get_local_part_reward(part_correct_np, sample_i, p_idx)
-                                                        rewards_local.append(1.0 if int(corr_val) == 1 else 0.0)
+                                                        corr_q4 = _get_local_part_reward(part_correct_np, sample_i, 3)
+                                                        t4_rewards.append(1.0 if int(corr_q4) == 1 else 0.0)
+                                                    t4_reward_t = torch.tensor(t4_rewards, device=device, dtype=torch.float32)
+                                                    t4_adv_t = _dr_grpo_adv(t4_reward_t)
+                                                    for j, sample_i in enumerate(grp_t4):
+                                                        valid_mask = response_mask[sample_i]
+                                                        modified_advantages[sample_i, valid_mask] = t4_adv_t[j]
+                                                        stage1_assigned += int(valid_mask.sum().item())
+                                                else:
+                                                    # Stage-1 on t4: per-part reward in {0,1}, parse-fail treated as [0,0,0,0].
+                                                    per_part_adv = {}
+                                                    for p_idx in range(4):
+                                                        rewards_local = []
+                                                        for sample_i in grp_t4:
+                                                            if sample_i in parse_fail_indices:
+                                                                rewards_local.append(0.0)
+                                                                continue
+                                                            corr_val = _get_local_part_reward(part_correct_np, sample_i, p_idx)
+                                                            rewards_local.append(1.0 if int(corr_val) == 1 else 0.0)
 
-                                                    reward_t = torch.tensor(rewards_local, device=device, dtype=torch.float32)
-                                                    adv_t = _dr_grpo_adv(reward_t)
-                                                    adv_t = adv_t * float(adv_part_scales[p_idx])
-                                                    per_part_adv[p_idx] = adv_t
+                                                        reward_t = torch.tensor(rewards_local, device=device, dtype=torch.float32)
+                                                        adv_t = _dr_grpo_adv(reward_t)
+                                                        adv_t = adv_t * float(adv_part_scales[p_idx])
+                                                        per_part_adv[p_idx] = adv_t
 
-                                                    for loc, sample_i in enumerate(grp_t4):
-                                                        if sample_i in parse_fail_indices:
-                                                            continue
-                                                        part_mask = (part_token_mask[sample_i, p_idx] > 0.5) & response_mask[sample_i]
-                                                        modified_advantages[sample_i, part_mask] = adv_t[loc]
-                                                        stage1_assigned += int(part_mask.sum().item())
+                                                        for loc, sample_i in enumerate(grp_t4):
+                                                            if sample_i in parse_fail_indices:
+                                                                continue
+                                                            part_mask = (part_token_mask[sample_i, p_idx] > 0.5) & response_mask[sample_i]
+                                                            modified_advantages[sample_i, part_mask] = adv_t[loc]
+                                                            stage1_assigned += int(part_mask.sum().item())
 
-                                                # Parse-fail t4 sample: use min over 4 part advantages for this sample.
-                                                for sample_i in parse_fail_indices:
-                                                    # sample_i's local position in grp_t4
-                                                    loc = grp_t4.index(sample_i)
-                                                    local_min_adv = torch.stack(
-                                                        [per_part_adv[p_idx][loc] for p_idx in range(4)],
-                                                        dim=0,
-                                                    ).min()
-                                                    valid_mask = response_mask[sample_i]
-                                                    modified_advantages[sample_i, valid_mask] = local_min_adv
-                                                    stage1_assigned += int(valid_mask.sum().item())
+                                                    # Parse-fail t4 sample: use min over 4 part advantages for this sample.
+                                                    for sample_i in parse_fail_indices:
+                                                        # sample_i's local position in grp_t4
+                                                        loc = grp_t4.index(sample_i)
+                                                        local_min_adv = torch.stack(
+                                                            [per_part_adv[p_idx][loc] for p_idx in range(4)],
+                                                            dim=0,
+                                                        ).min()
+                                                        valid_mask = response_mask[sample_i]
+                                                        modified_advantages[sample_i, valid_mask] = local_min_adv
+                                                        stage1_assigned += int(valid_mask.sum().item())
 
-                                                # For mix44/mix44444-like paths: any t4 response token not covered
-                                                # by part masks is explicitly neutralized to 0 (avoid fallback to
-                                                # initial GRPO advantage on leaked tokens).
-                                                if is_mix44_like or is_mix44444_like or is_mix44444_adaptive_like:
-                                                    for sample_i in grp_t4:
-                                                        if sample_i in parse_fail_indices:
-                                                            continue
-                                                        part_union_mask = (
-                                                            (part_token_mask[sample_i, :4] > 0.5).any(dim=0)
-                                                            & response_mask[sample_i]
-                                                        )
-                                                        leak_mask = response_mask[sample_i] & (~part_union_mask)
-                                                        if leak_mask.any():
-                                                            modified_advantages[sample_i, leak_mask] = 0.0
-                                                            stage1_assigned += int(leak_mask.sum().item())
+                                                    # For mix44/mix44444-like paths: any t4 response token not covered
+                                                    # by part masks is explicitly neutralized to 0 (avoid fallback to
+                                                    # initial GRPO advantage on leaked tokens).
+                                                    if is_mix44_like or is_mix44444_like or is_mix44444_adaptive_like:
+                                                        for sample_i in grp_t4:
+                                                            if sample_i in parse_fail_indices:
+                                                                continue
+                                                            part_union_mask = (
+                                                                (part_token_mask[sample_i, :4] > 0.5).any(dim=0)
+                                                                & response_mask[sample_i]
+                                                            )
+                                                            leak_mask = response_mask[sample_i] & (~part_union_mask)
+                                                            if leak_mask.any():
+                                                                modified_advantages[sample_i, leak_mask] = 0.0
+                                                                stage1_assigned += int(leak_mask.sum().item())
 
                                                 # Stage-2 on original-template branches (separate from t4).
                                                 if token_level_scores is not None:
